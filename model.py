@@ -413,10 +413,12 @@ class LlamaLM(nn.Module):
             ]
         )
         self.ln_final = RMSNorm(d_model)
+
         self.lm_head = Linear(d_model, vocab_size)
         # Tie the weights, since the paper mentions that "we share the same weight
         # matrix between the two embedding layers and the pre-softmax linear transformation"
-        # self.lm_head.weight = self.token_embeddings.weight
+        self.lm_head.weight = self.token_embeddings.weight
+
         # report number of parameters
         logger.info(
             f"number of non-embedding parameters: {self.get_num_params() / 1e6:.2f}M"
