@@ -7,6 +7,7 @@ import logging
 from jaxtyping import Float, Int, Bool
 import os
 import json
+from torchtune.modules import RotaryPositionalEmbeddings
 
 logger = logging.getLogger(__name__)
 
@@ -129,61 +130,6 @@ def softmax(x, dim=-1):
     )
 
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, context_length: int, dim: int, theta: float = 10000.0):
-        super().__init__()
-        self.register_buffer(
-            "_freq_cis_cache",
-            RotaryEmbedding._init_cache(context_length, dim, theta),
-            persistent=False,
-        )
-        self._freq_cis_cache: Float[Tensor, "2 context_length half_dim"]
-
-    @staticmethod
-    def _init_cache(
-        context_length: int, dim: int, theta: float
-    ) -> Float[Tensor, " 2 context_length half_dim"]:
-        assert dim % 2 == 0
-
-        d = torch.arange(0, dim, 2) / dim
-        freqs = torch.tensor(theta) ** -d
-        t = torch.arange(context_length)
-
-        freqs = einsum(t, freqs, "t, f -> t f")
-
-        cos, sin = torch.cos(freqs), torch.sin(freqs)
-        return torch.stack((cos, sin))
-
-    def forward(
-        self, x: Float[Tensor, " ... seq d"], pos_ids: Int[Tensor, " ... seq"] | None
-    ) -> Float[Tensor, " ... seq d"]:
-        x1, x2 = rearrange(x, "... (half_d xy) -> xy ... half_d", xy=2).unbind(0)
-
-        # Standard
-        # cos, sin = self._freq_cis_cache[:, pos_ids, :]
-
-        # einx
-        if pos_ids is not None:
-            cos, sin = einx.get_at(  # type: ignore
-                "cos_sin [pos] half_dim, ... -> cos_sin ... half_dim",
-                self._freq_cis_cache,
-                pos_ids,
-            )
-        else:
-            seq_len = x.size(-2)
-            cos, sin = self._freq_cis_cache[:, :seq_len, :].unbind(0)
-
-        # 2D rotation matrix applied to pairs in x
-        x1_rot = cos * x1 - sin * x2
-        x2_rot = sin * x1 + cos * x2
-        # result = einx.id("... x_half, ... x_half -> ... (x_half (1 + 1))", x1_rot, x2_rot).contiguous()
-        result = torch.concat((x1_rot, x2_rot), dim=-1)
-        return result
-
-    def extra_repr(self):
-        return f"context_length={self._freq_cis_cache.shape[0]}, dim/2={self._freq_cis_cache.shape[1]}"
-
-
 class CausalMultiHeadSelfAttention(nn.Module):
     """Multi-Head Self-Attention
 
@@ -208,7 +154,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         d_model: int,
         num_q_heads: int,
         num_kv_heads: int,
-        positional_encoder: RotaryEmbedding | None = None,
+        positional_encoder: RotaryPositionalEmbeddings | None = None,
     ):
         super().__init__()
         if positional_encoder is None:
@@ -231,7 +177,9 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         self.output_proj = Linear(self.num_q_heads * self.d_v, self.d_model)
 
-        self.positional_encoder: RotaryEmbedding | None = positional_encoder  # RoPE
+        self.positional_encoder: RotaryPositionalEmbeddings | None = (
+            positional_encoder  # RoPE
+        )
 
     def forward(
         self,
@@ -319,7 +267,7 @@ class TransformerBlock(nn.Module):
         num_q_heads: int,
         num_kv_heads: int,
         d_ff: int,
-        positional_encoder: RotaryEmbedding,
+        positional_encoder: RotaryPositionalEmbeddings,
     ):
         super().__init__()
         self.attn = CausalMultiHeadSelfAttention(
@@ -398,7 +346,9 @@ class LlamaLM(nn.Module):
         self.d_model = d_model
         self.token_embeddings = Embedding(vocab_size, d_model)
         d_head = d_model // num_q_heads
-        self.positional_encoder = RotaryEmbedding(context_length, d_head, rope_theta)
+        self.positional_encoder = RotaryPositionalEmbeddings(
+            dim=d_head, max_seq_len=context_length, base=int(rope_theta)
+        )
 
         self.layers = nn.ModuleList(
             [
@@ -445,7 +395,6 @@ class LlamaLM(nn.Module):
             (batch size, sequence_length, vocab_size) with the predicted unnormalized next-word
             distribution for each token.
         """
-        _, sequence_length = x.size()
         # (batch size, sequence_length, d_model)
         # NOTE: paper mentions "In the embedding layers, we multiply those
         # weights by sqrt(d_model)", but we aren't doing that here.
