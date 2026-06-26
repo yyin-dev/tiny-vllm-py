@@ -129,45 +129,6 @@ def softmax(x, dim=-1):
     )
 
 
-def scaled_dot_product_attention(
-    Q: Float[Tensor, " ... queries d_k"],
-    K: Float[Tensor, " ... keys    d_k"],
-    V: Float[Tensor, " ... keys    d_v"],
-    mask: Bool[Tensor, " ... queries keys"] | None = None,
-) -> Float[Tensor, " ... queries d_v"]:
-    """Scaled dot-product attention.
-
-    This function implements Eq. 1 of the Transformer paper.
-
-    Args:
-        Q: Tensor of queries, may have any number of leading dimensions.
-        K: Tensor of keys, sharing leading dimensions with Q.
-        V: Tensor of values, sharding leading dimensions with Q and K.
-        mask: An (optional) mask of shape (..., seq_len, seq_len).
-            Attention scores for positions with a mask value of `False` should
-            be masked out, i.e., not affect the softmaxed attention probabilities.
-
-    Returns:
-        torch.FloatTensor of shape (..., seq_len, value_dimension)
-        with the output of running your scaled dot product attention
-        implementation with the provided key, query, and value tensors.
-    """
-
-    d_k = K.shape[-1]
-    attention_scores = einsum(
-        Q, K, "... query d_k, ... key d_k -> ... query key"
-    ) / math.sqrt(d_k)
-
-    if mask is not None:
-        attention_scores = torch.where(mask, attention_scores, float("-inf"))
-
-    attention_weights = softmax(
-        attention_scores, dim=-1
-    )  # Softmax over the key dimension
-
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
-
-
 class RotaryEmbedding(nn.Module):
     def __init__(self, context_length: int, dim: int, theta: float = 10000.0):
         super().__init__()
@@ -245,25 +206,30 @@ class CausalMultiHeadSelfAttention(nn.Module):
     def __init__(
         self,
         d_model: int,
-        num_heads: int,
+        num_q_heads: int,
+        num_kv_heads: int,
         positional_encoder: RotaryEmbedding | None = None,
     ):
         super().__init__()
         if positional_encoder is None:
             print("Warning: No positional encoder provided!")
 
-        assert d_model % num_heads == 0
-        self.d_model = d_model
-        self.num_heads = num_heads
+        assert d_model % num_q_heads == 0
+        assert d_model % num_kv_heads == 0
+        assert num_q_heads % num_kv_heads == 0
 
-        self.d_k = d_model // num_heads
+        self.d_model = d_model
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+
+        self.d_k = d_model // num_q_heads
         self.d_v = self.d_k
 
-        self.q_proj = Linear(self.d_model, self.num_heads * self.d_k)
-        self.k_proj = Linear(self.d_model, self.num_heads * self.d_k)
-        self.v_proj = Linear(self.d_model, self.num_heads * self.d_v)
+        self.q_proj = Linear(self.d_model, self.num_q_heads * self.d_k)
+        self.k_proj = Linear(self.d_model, self.num_kv_heads * self.d_k)
+        self.v_proj = Linear(self.d_model, self.num_kv_heads * self.d_v)
 
-        self.output_proj = Linear(self.num_heads * self.d_v, self.d_model)
+        self.output_proj = Linear(self.num_q_heads * self.d_v, self.d_model)
 
         self.positional_encoder: RotaryEmbedding | None = positional_encoder  # RoPE
 
@@ -288,10 +254,13 @@ class CausalMultiHeadSelfAttention(nn.Module):
         V = self.v_proj(x)
 
         # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
-        Q, K, V = (
-            rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
-            for X in (Q, K, V)
-        )  # fmt: skip
+        Q = rearrange(Q, "... seq (heads d) -> ... heads seq d", heads=self.num_q_heads)
+        K = rearrange(
+            K, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
+        )
+        V = rearrange(
+            V, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
+        )
 
         if self.positional_encoder is not None:  # RoPE is enabled
             if token_positions is not None:  # We got explicit position ids
@@ -301,17 +270,16 @@ class CausalMultiHeadSelfAttention(nn.Module):
             Q = self.positional_encoder(Q, token_positions)
             K = self.positional_encoder(K, token_positions)
 
-        # Construct causal mask
-        iota = torch.arange(sequence_length, device=x.device)
-        qi = rearrange(iota, "query -> query 1")
-        kj = rearrange(iota, "key   -> 1   key")
-        causal_mask = qi >= kj  # (query, key)
-        causal_mask = causal_mask.__getitem__(
-            (None,) * len(batch_dims) + (...,)
-        )  # Add appropriate leading dimensions
-
         # Shape: (..., num_heads, sequence_length, d_k)
-        attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
+        # Use [torch.nn.functional.scaled_dot_product_attention] to support GQA
+        # When is_causal=True, casaul mask is constructed internally
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query=Q,
+            key=K,
+            value=V,
+            is_causal=True,
+            enable_gqa=True,
+        )
 
         # Concatenate the attention output from all heads.
         # (..., sequence_length, num_heads * d_v).
@@ -348,14 +316,16 @@ class TransformerBlock(nn.Module):
     def __init__(
         self,
         d_model: int,
-        num_heads: int,
+        num_q_heads: int,
+        num_kv_heads: int,
         d_ff: int,
         positional_encoder: RotaryEmbedding,
     ):
         super().__init__()
         self.attn = CausalMultiHeadSelfAttention(
             d_model=d_model,
-            num_heads=num_heads,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
             positional_encoder=positional_encoder,
         )
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
@@ -412,7 +382,8 @@ class LlamaLM(nn.Module):
         context_length: int,
         d_model: int,
         num_layers: int,
-        num_heads: int,
+        num_q_heads: int,
+        num_kv_heads: int,
         d_ff: int,
         rope_theta: float = 10_000.0,
     ):
@@ -426,14 +397,15 @@ class LlamaLM(nn.Module):
         self.context_length = context_length
         self.d_model = d_model
         self.token_embeddings = Embedding(vocab_size, d_model)
-        d_head = d_model // num_heads
+        d_head = d_model // num_q_heads
         self.positional_encoder = RotaryEmbedding(context_length, d_head, rope_theta)
 
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(
                     d_model=d_model,
-                    num_heads=num_heads,
+                    num_q_heads=num_q_heads,
+                    num_kv_heads=num_kv_heads,
                     d_ff=d_ff,
                     positional_encoder=self.positional_encoder,
                 )
