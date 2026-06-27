@@ -180,19 +180,43 @@ def main():
     llama = load_model().to(device)
     llama.eval()
 
-    logger.info("Start decoding...")
+    embeds = llama.token_embeddings(encoded)
+    print(embeds)
 
-    # TODO: pass an explicit attention_mask once we start padding/batching inputs.
-    # For this single unpadded prompt the outputs match the reference, but later
-    # batching and KV-cache work should not rely on Transformers inferring it.
-    res = llama.generate(
-        encoded,
-        max_new_tokens=16,
-        eos_token_id=tokenizer.eos_token_id,
-        do_sample=False,
-    )
+    layer0 = llama.layers[0]
 
-    print(tokenizer.decode(res))
+    normed = layer0.ln1(embeds)
+    print(normed)
+
+    q = layer0.attn.q_proj(normed)
+    print(q)
+
+    k = layer0.attn.k_proj(normed)
+    print(k)
+
+    v = layer0.attn.v_proj(normed)
+    print(v)
+
+    q = rearrange(q, "... seq (heads d) -> ... heads seq d", heads=32)
+    print(q.shape)
+    k = rearrange(k, "... seq (heads d) -> ... heads seq d", heads=8)
+
+    cos, sin = layer0.attn.positional_encoder(q)
+    rope_q, rope_k = model.apply_rotary_pos_emb(q, k, cos, sin)
+
+    rope_q = rearrange(rope_q, "... heads seq d -> ... seq heads d")
+    print("rope_q.shape:", rope_q.shape)
+    print("Q after applying RoPE:", rope_q)
+    print(rope_q[0, 0, 0, :])
+
+    rope_k = rearrange(rope_k, "... heads seq d -> ... seq heads d")
+    print("rope_k.shape:", rope_k.shape)
+    print("K after applying RoPE:", rope_k)
+    print(rope_k[0, 0, 0, :])
+
+    hidden = embeds
+    hidden = layer0(embeds)
+    print("1st attn block: ", hidden)
 
 
 if __name__ == "__main__":

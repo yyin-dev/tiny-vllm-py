@@ -2,12 +2,10 @@ from torch import nn, Tensor
 import torch
 import math
 from einops import einsum, rearrange
-import einx
 import logging
 from jaxtyping import Float, Int, Bool
 import os
 import json
-from torchtune.modules import RotaryPositionalEmbeddings
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +128,102 @@ def softmax(x, dim=-1):
     )
 
 
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class LlamaRotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        max_seq_len: int,
+        base: float = 10_000.0,
+        rope_scaling: dict | None = None,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        self.rope_scaling = rope_scaling
+        self.attention_scaling = 1.0
+        self.register_buffer("inv_freq", self._compute_inv_freq(), persistent=False)
+
+    def _compute_default_inv_freq(self) -> torch.Tensor:
+        return 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim)
+        )
+
+    def _compute_inv_freq(self) -> torch.Tensor:
+        inv_freq = self._compute_default_inv_freq()
+        if self.rope_scaling is None:
+            return inv_freq
+
+        rope_type = self.rope_scaling.get("rope_type", "default")
+        if rope_type != "llama3":
+            return inv_freq
+
+        factor = self.rope_scaling["factor"]
+        low_freq_factor = self.rope_scaling["low_freq_factor"]
+        high_freq_factor = self.rope_scaling["high_freq_factor"]
+        old_context_len = self.rope_scaling["original_max_position_embeddings"]
+
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+
+        wavelen = 2 * math.pi / inv_freq
+        inv_freq_llama = torch.where(
+            wavelen > low_freq_wavelen, inv_freq / factor, inv_freq
+        )
+        smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+            high_freq_factor - low_freq_factor
+        )
+        smoothed_inv_freq = (
+            1 - smooth_factor
+        ) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+        is_medium_freq = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
+        inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+        return inv_freq_llama
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if position_ids is None:
+            position_ids = torch.arange(x.shape[-2], device=x.device).unsqueeze(0)
+
+        inv_freq = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq @ position_ids_expanded).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype, device=x.device), sin.to(
+            dtype=x.dtype, device=x.device
+        )
+
+
 class CausalMultiHeadSelfAttention(nn.Module):
     """Multi-Head Self-Attention
 
@@ -154,7 +248,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         d_model: int,
         num_q_heads: int,
         num_kv_heads: int,
-        positional_encoder: RotaryPositionalEmbeddings | None = None,
+        positional_encoder: LlamaRotaryEmbedding | None = None,
     ):
         super().__init__()
         if positional_encoder is None:
@@ -177,7 +271,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         self.output_proj = Linear(self.num_q_heads * self.d_v, self.d_model)
 
-        self.positional_encoder: RotaryPositionalEmbeddings | None = (
+        self.positional_encoder: LlamaRotaryEmbedding | None = (
             positional_encoder  # RoPE
         )
 
@@ -211,12 +305,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
         )
 
         if self.positional_encoder is not None:  # RoPE is enabled
-            if token_positions is not None:  # We got explicit position ids
-                # Duplicate token positions for each head
-                token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
-
-            Q = self.positional_encoder(Q, token_positions)
-            K = self.positional_encoder(K, token_positions)
+            cos, sin = self.positional_encoder(Q, token_positions)
+            Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
 
         # Shape: (..., num_heads, sequence_length, d_k)
         # Use [torch.nn.functional.scaled_dot_product_attention] to support GQA
@@ -232,7 +322,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         # Concatenate the attention output from all heads.
         # (..., sequence_length, num_heads * d_v).
         attn_output = rearrange(
-            attn_output, "batch heads seq d_v -> batch seq (heads d_v)"
+            attn_output, "... heads seq d_v -> ... seq (heads d_v)"
         ).contiguous()
 
         # Apply the output projection
@@ -267,7 +357,7 @@ class TransformerBlock(nn.Module):
         num_q_heads: int,
         num_kv_heads: int,
         d_ff: int,
-        positional_encoder: RotaryPositionalEmbeddings,
+        positional_encoder: LlamaRotaryEmbedding,
     ):
         super().__init__()
         self.attn = CausalMultiHeadSelfAttention(
@@ -334,6 +424,7 @@ class LlamaLM(nn.Module):
         num_kv_heads: int,
         d_ff: int,
         rope_theta: float = 10_000.0,
+        rope_scaling: dict | None = None,
     ):
         # Store the model configuration for serialization / deserialization
         self.config = {
@@ -346,8 +437,11 @@ class LlamaLM(nn.Module):
         self.d_model = d_model
         self.token_embeddings = Embedding(vocab_size, d_model)
         d_head = d_model // num_q_heads
-        self.positional_encoder = RotaryPositionalEmbeddings(
-            dim=d_head, max_seq_len=context_length, base=int(rope_theta)
+        self.positional_encoder = LlamaRotaryEmbedding(
+            dim=d_head,
+            max_seq_len=context_length,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
 
         self.layers = nn.ModuleList(
@@ -401,7 +495,6 @@ class LlamaLM(nn.Module):
         embedded_tokens = self.token_embeddings(x)
 
         # (batch size, sequence_length, d_model)
-        # x = self.positional_encoder(embedded_tokens, positions)
         x = embedded_tokens
 
         for layer in self.layers:
@@ -420,7 +513,8 @@ class LlamaLM(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
-        eos_token_id: int | None = None,
+        eos_token_id: int | list[int] | None = None,
+        do_sample: bool = False,
     ):
         """
         Args:
@@ -459,16 +553,29 @@ class LlamaLM(nn.Module):
                 # Get the score of the kth item that we kept---items with lower scores should be masked.
                 threshold = topk_values[:, -1]
                 topk_mask = temperature_scaled_next_token_logits < threshold
-                temperature_scaled_next_token_logits.masked_fill(
-                    topk_mask, float("-inf")
+                temperature_scaled_next_token_logits = (
+                    temperature_scaled_next_token_logits.masked_fill(
+                        topk_mask, float("-inf")
+                    )
                 )
-            next_token_probabilities = softmax(
-                temperature_scaled_next_token_logits, dim=-1
-            )
-            next_token_id = torch.multinomial(next_token_probabilities, 1)
+
+            if do_sample:
+                next_token_probabilities = softmax(
+                    temperature_scaled_next_token_logits, dim=-1
+                )
+                next_token_id = torch.multinomial(next_token_probabilities, 1)
+            else:
+                next_token_id = torch.argmax(
+                    temperature_scaled_next_token_logits, dim=-1, keepdim=True
+                )
+
             # End generation if we see the EOS token ID
-            if eos_token_id is not None and next_token_id.item() == eos_token_id:
-                break
+            if eos_token_id is not None:
+                eos_token_ids = (
+                    eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
+                )
+                if next_token_id.item() in eos_token_ids:
+                    break
             x = torch.cat((x, next_token_id), dim=-1)
         new_token_ids = x[:, original_sequence_length:]
         return new_token_ids
