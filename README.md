@@ -9,6 +9,9 @@ decode separation, KV cache management, and continuous batching.
 ## Milestones
 
 - [ ] Reference-correct full forward
+  
+  No KV cache. Every decode is a full-prefix recomputation.
+
 - [ ] Generation loop
 - [ ] Prefill/decode split
 - [ ] KV cache
