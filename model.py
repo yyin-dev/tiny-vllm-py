@@ -1,5 +1,7 @@
 from torch import nn, Tensor
 import torch
+from torch.nn import Linear, Embedding
+import torch.nn.functional as F
 import math
 from einops import einsum, rearrange
 import logging
@@ -10,122 +12,15 @@ import json
 logger = logging.getLogger(__name__)
 
 
-class Linear(nn.Module):
-    def __init__(self, d_in: int, d_out: int):
-        """A linear layer initialized with truncated normal fan-in fan-out.
-
-        Args:
-            d_in: int
-                The number of input features.
-            d_out: int
-                The number of output features.
-        """
-
-        super().__init__()
-        std = math.sqrt(2 / (d_in + d_out))
-        self.weight: Float[Tensor, " d_out d_in"] = nn.Parameter(
-            nn.init.trunc_normal_(
-                torch.empty(d_out, d_in), std=std, a=-3 * std, b=3 * std
-            ),
-            requires_grad=True,
-        )
-
-    def forward(self, x: Float[Tensor, " ... d_in"]) -> Float[Tensor, " ... d_out"]:
-        return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
-
-    def extra_repr(self):
-        return f"d_out={self.weight.shape[0]}, d_in={self.weight.shape[1]}"
-
-
-class Embedding(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int):
-        super().__init__()
-        std = 1.0
-        self.weight = nn.Parameter(
-            nn.init.trunc_normal_(
-                torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std
-            ),
-            requires_grad=True,
-        )
-
-    def forward(self, token_ids: Int[Tensor, " ..."]) -> Float[Tensor, " ... d_model"]:
-        return self.weight[token_ids, :]
-
-    def extra_repr(self):
-        return f"vocab_size={self.weight.shape[0]}, d={self.weight.shape[1]}"
-
-
-def silu(x: torch.Tensor):
-    return x * torch.sigmoid(x)
-
-
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_ff: int):
         super().__init__()
-        self.w1 = Linear(d_model, d_ff)
-        self.w2 = Linear(d_ff, d_model)
-        self.w3 = Linear(d_model, d_ff)
+        self.w1 = Linear(d_model, d_ff, bias=False)
+        self.w2 = Linear(d_ff, d_model, bias=False)
+        self.w3 = Linear(d_model, d_ff, bias=False)
 
     def forward(self, x):
-        return self.w2(silu(self.w1(x)) * self.w3(x))
-
-
-class RMSNorm(nn.Module):
-    """
-    This module implements root mean square layer normalization, as
-    described in Eq. 4 of https://arxiv.org/abs/1910.07467
-
-    Args:
-        hidden_size: int
-            Dimensionality of the input to normalize.
-        eps: float, default is 1e-5
-            A value added to the denominator for numerical stability.
-
-    Returns:
-        FloatTensor of same shape as input.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-5,
-        device=None,
-    ):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, device=device))
-        self.eps = eps
-
-    def forward(self, x):
-        """
-        Args:
-            x: FloatTensor of shape `(batch_size, *)`.
-                The input to apply root mean square layer normalization on.
-
-        Returns:
-            FloatTensor of same shape as input
-        """
-        # NOTE: in practice, many implementations will
-        # manually upcast the input to fp32 here to prevent overflow when you
-        # square the input.
-        # https://github.com/pytorch/pytorch/issues/66707
-        in_dtype = x.dtype
-
-        x = x.to(torch.float32)
-        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        x = x * rms
-
-        return (self.weight * x).to(in_dtype)
-
-    def extra_repr(self):
-        return f"hidden_size={self.weight.shape[0]}, eps={self.eps}"
-
-
-def softmax(x, dim=-1):
-    rescaled_input = x - torch.max(x, dim=dim, keepdim=True)[0]
-    exponentiated_rescaled_input = torch.exp(rescaled_input)
-    return exponentiated_rescaled_input / torch.sum(
-        exponentiated_rescaled_input, dim=dim, keepdim=True
-    )
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -265,11 +160,11 @@ class CausalMultiHeadSelfAttention(nn.Module):
         self.d_k = d_model // num_q_heads
         self.d_v = self.d_k
 
-        self.q_proj = Linear(self.d_model, self.num_q_heads * self.d_k)
-        self.k_proj = Linear(self.d_model, self.num_kv_heads * self.d_k)
-        self.v_proj = Linear(self.d_model, self.num_kv_heads * self.d_v)
+        self.q_proj = Linear(self.d_model, self.num_q_heads * self.d_k, bias=False)
+        self.k_proj = Linear(self.d_model, self.num_kv_heads * self.d_k, bias=False)
+        self.v_proj = Linear(self.d_model, self.num_kv_heads * self.d_v, bias=False)
 
-        self.output_proj = Linear(self.num_q_heads * self.d_v, self.d_model)
+        self.output_proj = Linear(self.num_q_heads * self.d_v, self.d_model, bias=False)
 
         self.positional_encoder: LlamaRotaryEmbedding | None = (
             positional_encoder  # RoPE
@@ -367,8 +262,8 @@ class TransformerBlock(nn.Module):
             positional_encoder=positional_encoder,
         )
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
-        self.ln1 = RMSNorm(d_model)
-        self.ln2 = RMSNorm(d_model)
+        self.ln1 = nn.RMSNorm(d_model)
+        self.ln2 = nn.RMSNorm(d_model)
 
     def forward(self, x: torch.Tensor):
         """
@@ -456,9 +351,9 @@ class LlamaLM(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.ln_final = RMSNorm(d_model)
+        self.ln_final = nn.RMSNorm(d_model)
 
-        self.lm_head = Linear(d_model, vocab_size)
+        self.lm_head = Linear(d_model, vocab_size, bias=False)
         # Tie the weights, since the paper mentions that "we share the same weight
         # matrix between the two embedding layers and the pre-softmax linear transformation"
         self.lm_head.weight = self.token_embeddings.weight
@@ -560,7 +455,7 @@ class LlamaLM(nn.Module):
                 )
 
             if do_sample:
-                next_token_probabilities = softmax(
+                next_token_probabilities = F.softmax(
                     temperature_scaled_next_token_logits, dim=-1
                 )
                 next_token_id = torch.multinomial(next_token_probabilities, 1)
