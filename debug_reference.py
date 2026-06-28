@@ -7,6 +7,7 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     LlamaForCausalLM,
+    PreTrainedTokenizer,
 )
 import einops
 
@@ -54,13 +55,28 @@ def main():
         device = "cpu"
 
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(model_name)
     model: LlamaForCausalLM = AutoModelForCausalLM.from_pretrained(model_name)
     model = model.to(device)
 
-    input = "How are you?"
-    encoded = torch.tensor(tokenizer.encode(input), device=device).reshape((1, -1))
-    print(encoded)
+    # Batch encoding
+    # https://huggingface.co/docs/transformers/main/main_classes/tokenizer#transformers.PythonBackend.__call__
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    input = ["How are you?", "How are you?", "Which model are you?"]
+
+    # Left-padding is the convention for inference. Autoregressive models
+    # generate tokens based on the last position of the input sequence. Left
+    # padding ensures that the actual text tokens are at the end of the tensor
+    # just before generation starts, preventing the model from generating text
+    # based on a dummy pad token.
+    batch_encoding = tokenizer(
+        input, padding=True, return_attention_mask=True, padding_side="left"
+    )
+    print(batch_encoding.input_ids)
+    print(batch_encoding.attention_mask)
+
+    encoded = torch.tensor(batch_encoding.input_ids, device=device)
+    attention_mask = torch.tensor(batch_encoding.attention_mask, device=device)
     prompt_len = encoded.shape[-1]
     max_new_tokens = 11
 
@@ -68,18 +84,25 @@ def main():
 
     logits = model(encoded).logits
     first_next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
-    print("reference first greedy token id:", first_next_token.item())
+    print("reference first greedy token id:", first_next_token)
     print(
         "reference first greedy token text:",
-        tokenizer.decode(first_next_token[0]),
+        tokenizer.decode(first_next_token[:]),
     )
 
-    res = model.generate(inputs=encoded, max_new_tokens=max_new_tokens, do_sample=False)
+    res = model.generate(
+        inputs=encoded,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        attention_mask=attention_mask,
+    )
 
     decoded_full = tokenizer.decode(res[0])
     decoded_new = tokenizer.decode(res[0, prompt_len:])
     print("reference decoded full:", decoded_full)
     print("reference decoded new:", decoded_new)
+
+    return
 
     # ====================== For debugging ==========================
     embeddings: torch.Tensor = model.model.embed_tokens(encoded)
