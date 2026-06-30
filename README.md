@@ -9,7 +9,7 @@ decode separation, KV cache management, and continuous batching.
 ## Milestones
 
 - [x] Checkpoint loading & Forward decode
-- [ ] KV cache
+- [x] KV cache
 - [ ] Batch inference
 - [ ] Static batching
 - [ ] Continuous batching
@@ -95,7 +95,7 @@ At time=t, the model is allowed to attend to all previous tokens, including t.
 
 **Debugging workflow.** I manually replicated the forward flow in my debug script `debug_kv_cache.py`. It works but has several downsides: (1) it's cumbersome to write (2) the forward path and the debug path are two separate paths and it's expensive and error-prone to keep the two in sync. There are cases where I got really confused when I updated the model forward path without updating the debug path.
 
-A better approach is to run the actual forward path during debugging, but add instrumentation logic for debugging purposes. In this case, we can add in a debug collector that collects intermediate results. 
+A better approach is to run the actual forward path during debugging, but add instrumentation logic for debugging purposes. In this case, we can add in a debug collector that collects intermediate results. I asked Codex to implement a basic version.
 
 ### Mistakes I made in Initial Implementation
 
