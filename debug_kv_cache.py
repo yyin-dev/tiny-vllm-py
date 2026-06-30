@@ -1,100 +1,16 @@
 import torch
-import safetensors
-import model
 import logging
-import json
 from kv_cache import KVCache
 from debug_collector import DebugCollector
 from model import LlamaLM
 from einops import rearrange
 from transformers import PreTrainedTokenizer, AutoTokenizer
+from load_checkpoint import load_model
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
-
-WEIGHTS_PATH = "/Users/yy0125/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6/model.safetensors"
-CONFIG_PATH = "/Users/yy0125/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6/config.json"
-
-
-def load_model() -> LlamaLM:
-    logger.info("Initializing Llama Model...")
-    with open(CONFIG_PATH, "r") as f:
-        config = json.load(f)
-        vocab_size = config["vocab_size"]
-        d_model = config["hidden_size"]
-        num_layers = config["num_hidden_layers"]
-        num_q_heads = config["num_attention_heads"]
-        num_kv_heads = config["num_key_value_heads"]
-        d_ff = config["intermediate_size"]
-        rope_theta = config["rope_theta"]
-        rope_scaling = config.get("rope_scaling")
-        context_length = config["max_position_embeddings"]
-
-    llama = model.LlamaLM(
-        vocab_size=vocab_size,
-        context_length=context_length,
-        d_model=d_model,
-        num_layers=num_layers,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        d_ff=d_ff,
-        rope_theta=rope_theta,
-        rope_scaling=rope_scaling,
-    )
-    state_dict = llama.state_dict()
-
-    logger.info("Loading from checkpoint...")
-    loaded_checkpoint = {}
-    with safetensors.safe_open(WEIGHTS_PATH, framework="pt") as f:
-
-        def set(ckpt_name, state_dict_name):
-            ckpt_weights = f.get_tensor(ckpt_name)
-            state_dict_weights = state_dict[state_dict_name]
-            assert ckpt_weights.shape == state_dict_weights.shape
-            loaded_checkpoint[state_dict_name] = ckpt_weights
-
-        # Technically it's sufficient to only set "token_embedding.weights" because
-        # the two weights are tied. However, set both here s.t. we can use
-        # load_state_dict(strict=True)
-        set("model.embed_tokens.weight", "token_embeddings.weight")
-        set("model.embed_tokens.weight", "lm_head.weight")
-
-        for l in range(num_layers):
-            set(f"model.layers.{l}.input_layernorm.weight", f"layers.{l}.ln1.weight")
-            set(
-                f"model.layers.{l}.self_attn.q_proj.weight",
-                f"layers.{l}.attn.q_proj.weight",
-            )
-            set(
-                f"model.layers.{l}.self_attn.k_proj.weight",
-                f"layers.{l}.attn.k_proj.weight",
-            )
-            set(
-                f"model.layers.{l}.self_attn.v_proj.weight",
-                f"layers.{l}.attn.v_proj.weight",
-            )
-            set(
-                f"model.layers.{l}.self_attn.o_proj.weight",
-                f"layers.{l}.attn.output_proj.weight",
-            )
-            set(
-                f"model.layers.{l}.post_attention_layernorm.weight",
-                f"layers.{l}.ln2.weight",
-            )
-            set(f"model.layers.{l}.mlp.up_proj.weight", f"layers.{l}.ffn.w3.weight")
-            set(f"model.layers.{l}.mlp.gate_proj.weight", f"layers.{l}.ffn.w1.weight")
-            set(f"model.layers.{l}.mlp.down_proj.weight", f"layers.{l}.ffn.w2.weight")
-
-        set("model.norm.weight", "ln_final.weight")
-
-    logger.info("Set model weights based on checkpoint")
-    llama.load_state_dict(loaded_checkpoint, strict=True)
-
-    logger.info("Model loaded with weights from checkpoint")
-    return llama
 
 
 def max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
