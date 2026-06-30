@@ -8,6 +8,7 @@ import logging
 from jaxtyping import Float, Int, Bool
 import os
 import json
+from kv_cache import KVCache
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,14 @@ class LlamaRotaryEmbedding(nn.Module):
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        x: (b, h, seq, d)
+        position_id: (b, seq)
+
+        `x` is only used for:
+          [device];
+          [shape], when [position_ids] isn't provided.
+        """
         if position_ids is None:
             position_ids = torch.arange(x.shape[-2], device=x.device).unsqueeze(0)
 
@@ -144,6 +153,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         num_q_heads: int,
         num_kv_heads: int,
         positional_encoder: LlamaRotaryEmbedding | None = None,
+        layer_idx: int | None = None,
     ):
         super().__init__()
         if positional_encoder is None:
@@ -170,10 +180,12 @@ class CausalMultiHeadSelfAttention(nn.Module):
             positional_encoder  # RoPE
         )
 
+        self.layer_idx = layer_idx
+
     def forward(
         self,
         x: Float[Tensor, " ... seq d_k"],
-        token_positions: Int[Tensor, " ... seq"] | None = None,
+        kv_cache: KVCache | None = None,
     ) -> Float[Tensor, " ... seq d_v"]:
         """
         Args:
@@ -186,22 +198,66 @@ class CausalMultiHeadSelfAttention(nn.Module):
         *batch_dims, sequence_length, d_model = x.size()
         assert d_model == self.d_model
 
+        # Need to reshape Q, K, V to dimension expected by [scaled_dot_product_attention]
         Q = self.q_proj(x)
-        K = self.k_proj(x)
-        V = self.v_proj(x)
-
-        # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
         Q = rearrange(Q, "... seq (heads d) -> ... heads seq d", heads=self.num_q_heads)
-        K = rearrange(
-            K, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
-        )
-        V = rearrange(
-            V, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
-        )
 
-        if self.positional_encoder is not None:  # RoPE is enabled
-            cos, sin = self.positional_encoder(Q, token_positions)
-            Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
+        if kv_cache is None or kv_cache.is_empty(self.layer_idx):
+            # without cache or prefill
+            K = self.k_proj(x)
+            V = self.v_proj(x)
+
+            K = rearrange(
+                K, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
+            )
+            V = rearrange(
+                V, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
+            )
+
+            if self.positional_encoder is not None:  # RoPE is enabled
+                cos, sin = self.positional_encoder(Q)
+                Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
+
+            if kv_cache:
+                kv_cache.append_kvs(self.layer_idx, K, V)
+
+            is_causal = True
+        else:
+            # decode
+            # Q: (b num_heads 1 head_dim)
+            assert sequence_length == 1
+
+            current_token_k = self.k_proj(x)  # b 1 (h d)
+            current_token_v = self.v_proj(x)  # b 1 (h d)
+
+            current_token_k = rearrange(
+                current_token_k,
+                "... seq (heads d) -> ... heads seq d",
+                heads=self.num_kv_heads,
+            )
+            current_token_v = rearrange(
+                current_token_v,
+                "... seq (heads d) -> ... heads seq d",
+                heads=self.num_kv_heads,
+            )
+
+            # get token position from kv-cache length
+            token_positions = torch.tensor(
+                [[kv_cache.current_length(self.layer_idx)]], device=Q.device
+            )
+
+            if self.positional_encoder is not None:
+                cos, sin = self.positional_encoder(Q, token_positions)
+                Q, current_token_k = apply_rotary_pos_emb(Q, current_token_k, cos, sin)
+
+            k_prefix, v_prefix = kv_cache.get_kv_prefix(self.layer_idx)
+
+            K = torch.cat([k_prefix, current_token_k], dim=-2)
+            V = torch.cat([v_prefix, current_token_v], dim=-2)
+
+            kv_cache.append_kvs(self.layer_idx, current_token_k, current_token_v)
+
+            is_causal = False
 
         # Shape: (..., num_heads, sequence_length, d_k)
         # Use [torch.nn.functional.scaled_dot_product_attention] to support GQA
@@ -210,7 +266,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
             query=Q,
             key=K,
             value=V,
-            is_causal=True,
+            is_causal=is_causal,
             enable_gqa=True,
         )
 
@@ -253,6 +309,7 @@ class TransformerBlock(nn.Module):
         num_kv_heads: int,
         d_ff: int,
         positional_encoder: LlamaRotaryEmbedding,
+        layer_idx: int,
     ):
         super().__init__()
         self.attn = CausalMultiHeadSelfAttention(
@@ -260,12 +317,17 @@ class TransformerBlock(nn.Module):
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
             positional_encoder=positional_encoder,
+            layer_idx=layer_idx,
         )
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
         self.ln1 = nn.RMSNorm(d_model)
         self.ln2 = nn.RMSNorm(d_model)
 
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: KVCache | None = None,
+    ):
         """
         Args:
             x: FloatTensor of shape `(batch_size, sequence_length, d_model)`.
@@ -276,8 +338,9 @@ class TransformerBlock(nn.Module):
         """
         # NOTE: this is a pre-norm Transformer, and differs from the original
         # description in the paper.
+
         # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
+        x_attn = self.attn(self.ln1(x), kv_cache=kv_cache)
         attn_sublayer_output = x + x_attn
 
         # Apply the feed-forward sublayer
@@ -347,8 +410,9 @@ class LlamaLM(nn.Module):
                     num_kv_heads=num_kv_heads,
                     d_ff=d_ff,
                     positional_encoder=self.positional_encoder,
+                    layer_idx=layer_idx,
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
         self.ln_final = nn.RMSNorm(d_model)
@@ -374,7 +438,9 @@ class LlamaLM(nn.Module):
         return n_params
 
     def forward(
-        self, x: Int[Tensor, " ... sequence_length"]
+        self,
+        x: Int[Tensor, " ... sequence_length"],
+        kv_cache: KVCache | None = None,
     ) -> Float[Tensor, " ... sequence_length vocab_size"]:
         """
         Args:
@@ -394,12 +460,49 @@ class LlamaLM(nn.Module):
 
         for layer in self.layers:
             # (batch size, sequence_length, d_model)
-            x = layer(x)
+            x = layer(x, kv_cache=kv_cache)
+
         # (batch size, sequence_length, d_model)
         x = self.ln_final(x)
         # (batch size, sequence_length, vocab_size)
         logits = self.lm_head(x)
         return logits
+
+    def generate_one_token(
+        self,
+        logits,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        do_sample: bool = False,
+    ) -> Tensor:
+        # apply temperature scaling
+        temperature_scaled_next_token_logits = logits / temperature
+        # If top-k is provided, take the tokens with the highest score
+        if top_k:
+            topk_values, _ = torch.topk(
+                temperature_scaled_next_token_logits,
+                min(top_k, temperature_scaled_next_token_logits.size(-1)),
+            )
+            # Get the score of the kth item that we kept---items with lower scores should be masked.
+            threshold = topk_values[:, -1]
+            topk_mask = temperature_scaled_next_token_logits < threshold
+            temperature_scaled_next_token_logits = (
+                temperature_scaled_next_token_logits.masked_fill(
+                    topk_mask, float("-inf")
+                )
+            )
+
+        if do_sample:
+            next_token_probabilities = F.softmax(
+                temperature_scaled_next_token_logits, dim=-1
+            )
+            next_token_id = torch.multinomial(next_token_probabilities, 1)
+        else:
+            next_token_id = torch.argmax(
+                temperature_scaled_next_token_logits, dim=-1, keepdim=True
+            )
+
+        return next_token_id
 
     @torch.no_grad()
     def generate(
@@ -410,6 +513,8 @@ class LlamaLM(nn.Module):
         top_k: int | None = None,
         eos_token_id: int | list[int] | None = None,
         do_sample: bool = False,
+        use_kv_cache: bool = True,
+        kv_cache: KVCache | None = None,
     ):
         """
         Args:
@@ -428,52 +533,76 @@ class LlamaLM(nn.Module):
         """
         if x.dim() == 1:
             x = x.unsqueeze(0)
-        original_sequence_length = x.size(-1)
-        for _ in range(max_new_tokens):
-            # Take the last `context_length` tokens if the input is
-            # beyond the model's context length
-            x = x[:, -self.context_length :] if x.size(1) > self.context_length else x
-            # Get the logits from the model
-            logits = self.forward(x)
-            # Take the logits for the next token
-            next_token_logits = logits[:, -1]
-            # apply temperature scaling
-            temperature_scaled_next_token_logits = next_token_logits / temperature
-            # If top-k is provided, take the tokens with the highest score
-            if top_k:
-                topk_values, _ = torch.topk(
-                    temperature_scaled_next_token_logits,
-                    min(top_k, temperature_scaled_next_token_logits.size(-1)),
-                )
-                # Get the score of the kth item that we kept---items with lower scores should be masked.
-                threshold = topk_values[:, -1]
-                topk_mask = temperature_scaled_next_token_logits < threshold
-                temperature_scaled_next_token_logits = (
-                    temperature_scaled_next_token_logits.masked_fill(
-                        topk_mask, float("-inf")
-                    )
+
+        def should_end_generation(next_token_id: Tensor):
+            eos_token_ids = (
+                eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
+            )
+            return next_token_id.item() in eos_token_ids
+
+        if use_kv_cache:
+            if kv_cache is None:
+                kv_cache = KVCache()
+
+            # prefill
+            print("Prefilling phase starts!")
+            prefill_logits = self.forward(x, kv_cache=kv_cache)
+            next_token_logits = prefill_logits[:, -1]
+            next_token_id = self.generate_one_token(
+                next_token_logits, temperature, top_k, do_sample
+            )
+            print("Prefilling phase done!")
+
+            # decode
+            print("Decode phase starts!")
+            decode_results = [next_token_id]
+            for _ in range(max_new_tokens - 1):
+                prev_token = torch.tensor([next_token_id], device=x.device)
+                prev_token = rearrange(prev_token, "(b s) -> b s", b=1, s=1)
+
+                decode_logits = self.forward(prev_token, kv_cache=kv_cache)
+                next_token_logits = decode_logits[:, -1]
+
+                next_token_id = self.generate_one_token(
+                    next_token_logits, temperature, top_k, do_sample
                 )
 
-            if do_sample:
-                next_token_probabilities = F.softmax(
-                    temperature_scaled_next_token_logits, dim=-1
-                )
-                next_token_id = torch.multinomial(next_token_probabilities, 1)
-            else:
-                next_token_id = torch.argmax(
-                    temperature_scaled_next_token_logits, dim=-1, keepdim=True
-                )
-
-            # End generation if we see the EOS token ID
-            if eos_token_id is not None:
-                eos_token_ids = (
-                    eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
-                )
-                if next_token_id.item() in eos_token_ids:
+                # End generation if we see the EOS token ID
+                if should_end_generation(next_token_id):
                     break
-            x = torch.cat((x, next_token_id), dim=-1)
-        new_token_ids = x[:, original_sequence_length:]
-        return new_token_ids
+
+                decode_results.append(next_token_id)
+
+            print("Decode phase done!")
+            return torch.tensor(decode_results)
+        else:
+            original_sequence_length = x.size(-1)
+            for _ in range(max_new_tokens):
+                # Take the last `context_length` tokens if the input is
+                # beyond the model's context length
+                x = (
+                    x[:, -self.context_length :]
+                    if x.size(1) > self.context_length
+                    else x
+                )
+
+                # Get the logits from the model
+                logits = self.forward(x)
+
+                # Take the logits for the next token
+                next_token_logits = logits[:, -1]
+
+                next_token_id = self.generate_one_token(
+                    next_token_logits, temperature, top_k, do_sample
+                )
+
+                # End generation if we see the EOS token ID
+                if should_end_generation(next_token_id):
+                    break
+
+                x = torch.cat((x, next_token_id), dim=-1)
+
+            return x[:, original_sequence_length:]
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path: str):

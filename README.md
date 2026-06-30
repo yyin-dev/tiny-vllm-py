@@ -9,8 +9,8 @@ decode separation, KV cache management, and continuous batching.
 ## Milestones
 
 - [x] Checkpoint loading & Forward decode
-- [ ] Prefill/decode split
 - [ ] KV cache
+- [ ] Batch inference
 - [ ] Static batching
 - [ ] Continuous batching
 - [ ] Paged KV cache
@@ -52,6 +52,56 @@ In the end, I decided to continue using Llama-3.2-1B-Instruct because:
 - It's already matching reference implementation
 - Later milestones is mostly about using it correctly without needing to think about its internals. The biggest thing is to ensure that `position_ids` are constructed correctly.
 - I can just treat RoPE as a black box going forwards.
+
+## KV Cache
+
+### Mental Model
+
+We don't need to create new API for inference with KV-cache: just add a `use_kv_cache` argument to the current `generate` method. Internally, `generate` creates a `KVCache` object.
+
+The KV-cache only matters at the attention-layer. For other modules, just need to thread through the kv-cache argument.
+
+The KV cache stores RoPE-rotated K and plain Vs. The KV cache interface:
+```python
+KVCache:
+    def append_kvs(self, layer_idx, ks, vs)
+    	# ks: (batch_size, num_kv_heads, seq_len, k_head_dim)
+    	# vs: (batch_size, num_kv_heads, seq_len, v_head_dim)
+    	# This supports both prefill and decode
+    	# During prefill, seq_len > 1. During decode, seq_len = 1
+
+    def get_kv_prefix(self, layer_idx) -> (ks, vs):
+      # Always returns the full prefix
+
+    def current_length(self, layer_idx) -> int:
+```
+
+At a high-level, what KV-cache really changes is just how you compute K/V in the attn block. In prefill, need to store K/V to the cache. In decode, compute Q/K/V only for the new token, and retrieve K/V prefix for previous tokens from the cache, construct the full K/V for the full sequence, then run the attention computation.
+
+For attention layer: 
+
+* At prefill, input is full prompt, computes the full K/Vs, apply RoPE to Ks, and store those kv-cache. Returns attention block output and updated KV cache. Prefill will use the exact same attention path as a full-sequence forward. 
+* At decode, input is new token and kv cache, computes q/k/v vector for the new token, apply RoPE to k, and store the k/v for the new token in KV-cache. For Q/K/V used in attention computation, Q comes from the current token input, but most K/V come from the cache. Returns attention block output and updated KV cache. Decode cannot reuse the same attention as a full-sequence forward because it needs to pull KV entries from the cache instead of computing it. In fact, it couldn't compute KVs for previous tokens because the input is just a single token. 
+
+At decode, the self-attention layer needs to use the correct token-position index of the entire sequence s.t. positional embedding works correctly. 
+
+At time=t, the model is allowed to attend to all previous tokens, including t. 
+
+### Design Choices
+
+**How would the self-attention layer know whether it's in prefill or decode phase?** One option is to pass in an extra argument (e.g. `is_prefill: bool`). However, a better option is to just use the kv-cache state. When the kv-cache is empty, it's in the prefill phase. When it's not empty, it's in the decode phase.
+
+**In the decode phase, how would the self-attention layer know the position of the current token?** One option is to pass in extra argument like `token_position` from `generate`. However, we can similarly get this information from the cache. The token position is the kv-cache length *before* appending k/v of the current token into the cache.
+
+**Debugging workflow.** I manually replicated the forward flow in my debug script `debug_kv_cache.py`. It works but has several downsides: (1) it's cumbersome to write (2) the forward path and the debug path are two separate paths and it's expensive and error-prone to keep the two in sync. There are cases where I got really confused when I updated the model forward path without updating the debug path.
+
+A better approach is to run the actual forward path during debugging, but add instrumentation logic for debugging purposes. In this case, we can add in a debug collector that collects intermediate results. 
+
+### Mistakes I made in Initial Implementation
+
+Forward vs. Debug path mismatch.
+
+**Causalness in prefill vs. decode.** At one point, I found that Q, K, V matches but the attention results mismatch. This implies the problem is in the attention calculation itself. In prefill, we need causal self-attention (`is_causal=True`). In decode, the query is allowed to attend to all previous tokens, so `is_causal=False`!
 
 
 ## Reference

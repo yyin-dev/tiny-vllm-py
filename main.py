@@ -190,6 +190,7 @@ def main():
         max_new_tokens=16,
         eos_token_id=tokenizer.eos_token_id,
         do_sample=False,
+        use_kv_cache=False,
     )
 
     print(tokenizer.decode(res))
