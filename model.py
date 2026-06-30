@@ -9,6 +9,7 @@ from jaxtyping import Float, Int, Bool
 import os
 import json
 from kv_cache import KVCache
+from debug_collector import DebugCollector
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +187,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         self,
         x: Float[Tensor, " ... seq d_k"],
         kv_cache: KVCache | None = None,
+        debug_collector: DebugCollector | None = None,
     ) -> Float[Tensor, " ... seq d_v"]:
         """
         Args:
@@ -201,6 +203,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
         # Need to reshape Q, K, V to dimension expected by [scaled_dot_product_attention]
         Q = self.q_proj(x)
         Q = rearrange(Q, "... seq (heads d) -> ... heads seq d", heads=self.num_q_heads)
+        if debug_collector:
+            debug_collector.record(self.layer_idx, "q_pre_rope", Q)
 
         if kv_cache is None or kv_cache.is_empty(self.layer_idx):
             # without cache or prefill
@@ -213,10 +217,16 @@ class CausalMultiHeadSelfAttention(nn.Module):
             V = rearrange(
                 V, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
             )
+            if debug_collector:
+                debug_collector.record(self.layer_idx, "k_pre_rope", K)
+                debug_collector.record(self.layer_idx, "v_for_attn", V)
 
             if self.positional_encoder is not None:  # RoPE is enabled
                 cos, sin = self.positional_encoder(Q)
                 Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
+                if debug_collector:
+                    debug_collector.record(self.layer_idx, "q_post_rope", Q)
+                    debug_collector.record(self.layer_idx, "k_post_rope", K)
 
             if kv_cache:
                 kv_cache.append_kvs(self.layer_idx, K, V)
@@ -240,20 +250,38 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 "... seq (heads d) -> ... heads seq d",
                 heads=self.num_kv_heads,
             )
+            if debug_collector:
+                debug_collector.record(self.layer_idx, "k_pre_rope", current_token_k)
+                debug_collector.record(self.layer_idx, "v_current", current_token_v)
 
             # get token position from kv-cache length
             token_positions = torch.tensor(
                 [[kv_cache.current_length(self.layer_idx)]], device=Q.device
             )
+            if debug_collector:
+                debug_collector.record(
+                    self.layer_idx, "token_positions", token_positions
+                )
 
             if self.positional_encoder is not None:
                 cos, sin = self.positional_encoder(Q, token_positions)
                 Q, current_token_k = apply_rotary_pos_emb(Q, current_token_k, cos, sin)
+                if debug_collector:
+                    debug_collector.record(self.layer_idx, "q_post_rope", Q)
+                    debug_collector.record(
+                        self.layer_idx, "k_post_rope", current_token_k
+                    )
 
             k_prefix, v_prefix = kv_cache.get_kv_prefix(self.layer_idx)
+            if debug_collector:
+                debug_collector.record(self.layer_idx, "k_prefix", k_prefix)
+                debug_collector.record(self.layer_idx, "v_prefix", v_prefix)
 
             K = torch.cat([k_prefix, current_token_k], dim=-2)
             V = torch.cat([v_prefix, current_token_v], dim=-2)
+            if debug_collector:
+                debug_collector.record(self.layer_idx, "k_for_attn", K)
+                debug_collector.record(self.layer_idx, "v_for_attn", V)
 
             kv_cache.append_kvs(self.layer_idx, current_token_k, current_token_v)
 
@@ -269,6 +297,9 @@ class CausalMultiHeadSelfAttention(nn.Module):
             is_causal=is_causal,
             enable_gqa=True,
         )
+        if debug_collector:
+            debug_collector.record(self.layer_idx, "is_causal", is_causal)
+            debug_collector.record(self.layer_idx, "attn_output_heads", attn_output)
 
         # Concatenate the attention output from all heads.
         # (..., sequence_length, num_heads * d_v).
@@ -327,6 +358,7 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         kv_cache: KVCache | None = None,
+        debug_collector: DebugCollector | None = None,
     ):
         """
         Args:
@@ -340,7 +372,9 @@ class TransformerBlock(nn.Module):
         # description in the paper.
 
         # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x), kv_cache=kv_cache)
+        x_attn = self.attn(
+            self.ln1(x), kv_cache=kv_cache, debug_collector=debug_collector
+        )
         attn_sublayer_output = x + x_attn
 
         # Apply the feed-forward sublayer
@@ -441,6 +475,7 @@ class LlamaLM(nn.Module):
         self,
         x: Int[Tensor, " ... sequence_length"],
         kv_cache: KVCache | None = None,
+        debug_collector: DebugCollector | None = None,
     ) -> Float[Tensor, " ... sequence_length vocab_size"]:
         """
         Args:
@@ -460,7 +495,7 @@ class LlamaLM(nn.Module):
 
         for layer in self.layers:
             # (batch size, sequence_length, d_model)
-            x = layer(x, kv_cache=kv_cache)
+            x = layer(x, kv_cache=kv_cache, debug_collector=debug_collector)
 
         # (batch size, sequence_length, d_model)
         x = self.ln_final(x)
@@ -515,6 +550,7 @@ class LlamaLM(nn.Module):
         do_sample: bool = False,
         use_kv_cache: bool = True,
         kv_cache: KVCache | None = None,
+        debug_collector: DebugCollector | None = None,
     ):
         """
         Args:
@@ -544,9 +580,14 @@ class LlamaLM(nn.Module):
             if kv_cache is None:
                 kv_cache = KVCache()
 
+            if debug_collector:
+                debug_collector.set_prefill()
+
             # prefill
             print("Prefilling phase starts!")
-            prefill_logits = self.forward(x, kv_cache=kv_cache)
+            prefill_logits = self.forward(
+                x, kv_cache=kv_cache, debug_collector=debug_collector
+            )
             next_token_logits = prefill_logits[:, -1]
             next_token_id = self.generate_one_token(
                 next_token_logits, temperature, top_k, do_sample
@@ -556,11 +597,16 @@ class LlamaLM(nn.Module):
             # decode
             print("Decode phase starts!")
             decode_results = [next_token_id]
-            for _ in range(max_new_tokens - 1):
+            for step_idx in range(max_new_tokens - 1):
                 prev_token = torch.tensor([next_token_id], device=x.device)
                 prev_token = rearrange(prev_token, "(b s) -> b s", b=1, s=1)
 
-                decode_logits = self.forward(prev_token, kv_cache=kv_cache)
+                if debug_collector:
+                    debug_collector.set_decode_step(step_idx)
+
+                decode_logits = self.forward(
+                    prev_token, kv_cache=kv_cache, debug_collector=debug_collector
+                )
                 next_token_logits = decode_logits[:, -1]
 
                 next_token_id = self.generate_one_token(

@@ -4,6 +4,7 @@ import model
 import logging
 import json
 from kv_cache import KVCache
+from debug_collector import DebugCollector
 from model import LlamaLM
 from einops import rearrange
 from transformers import PreTrainedTokenizer, AutoTokenizer
@@ -265,6 +266,64 @@ def manual_debug(llama: LlamaLM):
         print_diff("attn_output", attn_output_ref, attn_output)
 
 
+def instrumentation_debug(llama: LlamaLM):
+    if torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    reference_tokens = torch.tensor([[128000, 4438, 527, 499, 30, 358]], device=device)
+    prefill_tokens = torch.tensor([[128000, 4438, 527, 499, 30]], device=device)
+    decode_token = torch.tensor([[358]], device=device)
+
+    reference_collector = DebugCollector()
+    _ = llama.forward(reference_tokens, debug_collector=reference_collector)
+
+    kv_cache = KVCache()
+    kv_collector = DebugCollector()
+    kv_collector.set_prefill()
+    _ = llama.forward(prefill_tokens, kv_cache=kv_cache, debug_collector=kv_collector)
+    kv_collector.set_decode_step(0)
+    _ = llama.forward(decode_token, kv_cache=kv_cache, debug_collector=kv_collector)
+
+    layer_idx = 0
+    print("================ Instrumentation =========================")
+    print_diff(
+        "Q last token before RoPE",
+        reference_collector.get("unset", layer_idx, "q_pre_rope")[:, :, -1:, :],
+        kv_collector.get("decode0", layer_idx, "q_pre_rope"),
+    )
+    print_diff(
+        "Q last token after RoPE",
+        reference_collector.get("unset", layer_idx, "q_post_rope")[:, :, -1:, :],
+        kv_collector.get("decode0", layer_idx, "q_post_rope"),
+    )
+    print_diff(
+        "K full prefix for attn",
+        reference_collector.get("unset", layer_idx, "k_post_rope"),
+        kv_collector.get("decode0", layer_idx, "k_for_attn"),
+    )
+    print_diff(
+        "V full prefix for attn",
+        reference_collector.get("unset", layer_idx, "v_for_attn"),
+        kv_collector.get("decode0", layer_idx, "v_for_attn"),
+    )
+    print_diff(
+        "attn_output",
+        reference_collector.get("unset", layer_idx, "attn_output_heads")[:, :, -1:, :],
+        kv_collector.get("decode0", layer_idx, "attn_output_heads"),
+    )
+    print(
+        "reference is_causal:",
+        reference_collector.get("unset", layer_idx, "is_causal"),
+    )
+    print("decode is_causal:", kv_collector.get("decode0", layer_idx, "is_causal"))
+    print(
+        "decode token positions:",
+        kv_collector.get("decode0", layer_idx, "token_positions"),
+    )
+
+
 def main():
     if torch.backends.mps.is_available():
         device = "mps"
@@ -283,7 +342,9 @@ def main():
     print(encoded)
 
     manual_debug(llama)
+    instrumentation_debug(llama)
 
+    print("================ Full Generation =========================")
     max_new_tokens = 16
     with torch.no_grad():
         kv_cache = KVCache()
