@@ -10,7 +10,6 @@ decode separation, KV cache management, and continuous batching.
 
 - [x] Checkpoint loading & Forward decode
 - [x] KV cache
-- [ ] Batch inference
 - [ ] Static batching
 - [ ] Continuous batching
 - [ ] Paged KV cache
@@ -102,6 +101,49 @@ A better approach is to run the actual forward path during debugging, but add in
 Forward vs. Debug path mismatch.
 
 **Causalness in prefill vs. decode.** At one point, I found that Q, K, V matches but the attention results mismatch. This implies the problem is in the attention calculation itself. In prefill, we need causal self-attention (`is_causal=True`). In decode, the query is allowed to attend to all previous tokens, so `is_causal=False`!
+
+## Static Batching
+
+Static batching means sequences in a batch advance in lock-step. The two immediate consequences are:
+
+* During prefill, we need to pad sequences to the same length
+* During decode, some sequences already ended while others are still decoding
+
+The goal is to make batch inference produce result just like without batching. Similar to implementing KV-cache, the focus is still the self-attention: in decoder-only transformer, self-attention is the only operation that mixes information across sequence positions and thus requires handling things like padding tokens carefully. 
+
+For correctness, we need to distinguish "physical sequence" and "logical sequence". 
+
+```
+physical index:  0   1   2   3   4   5   6   7
+logical index :          0   1   2   3
+                 PAD PAD a   b   c   EOS X   X
+```
+
+In the example sequence above, we use PAD for both prefill padding and X for inactive slots after the sequence finishes. 0..1 is padding, 6..7 is inactive slots, 0..7 is the physical sequence and 2..5 is the logical sequence. The convention is to treat EOS as a real generated token and as part of the logical sequence.
+
+What should we store in the KV cache? We have two options:
+
+1. Only store kvs for logical sequence. 
+   * Pro: No wasted memory. 
+   * Con: KVCache needs to manage the kv entries for each sequence as separate tensors instead of a single tensor. This also introduces extra complexity around indexing. 
+2. Store KVs for the full physical sequence
+   * Pro: simplicity.
+   * Con: wasted memory and computation. The cache doesn't track logical sequences and requires extra bookkeeping. 
+
+For now, we will implement Option 2 for simplicity. 
+
+Self-attention needs two pieces of information to handle batching:
+
+* An attention mask that tells it the positions it can attend to. For example, attention shouldn't attend to PAD tokens. 
+* A `position_ids` that tells it the position of the current position in the **logical** sequence. 
+
+This means we need to track at least the following metadata:
+
+* `pad_offset[i]`: physical position of the last padding token
+* `logical_seq_len[i]`: length of the current logical sequence
+* `is_finished[i]`: whether EOS has been generated for a sequence
+
+For sequence `i`, the physical positions in range `[pad_offset[i], pad_offset[i] + logical_seq_len[i])` are valid. Note that the range is left-closed, right-open. 
 
 
 ## Reference
