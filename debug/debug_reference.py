@@ -1,4 +1,6 @@
 """
+Debug script when working on checkpoint loading milestone.
+
 Steps through reference model to inspect activations for debugging purpose.
 """
 

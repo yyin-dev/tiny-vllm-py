@@ -9,6 +9,12 @@ import torch
 from einops import rearrange
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import os
+import sys
+
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parent_dir)
+
 import model as student_model
 
 WEIGHTS_PATH = "/Users/yy0125/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6/model.safetensors"

@@ -145,6 +145,9 @@ This means we need to track at least the following metadata:
 
 For sequence `i`, the physical positions in range `[pad_offset[i], pad_offset[i] + logical_seq_len[i])` are valid. Note that the range is left-closed, right-open. 
 
+## Directory Structure
+- `tests/`: testcases. Runnable throughout the project.
+- `debug/`: debug scripts when working on milestones. Expected to be runnable at the commit it's created or updated, but later commits might break it.
 
 ## Reference
 https://github.com/jmaczan/tiny-vllm

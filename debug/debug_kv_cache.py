@@ -1,11 +1,22 @@
+"""
+Debug script when working on KV cache milestone.
+"""
+
 import torch
 import logging
-from kv_cache import KVCache
-from debug_collector import DebugCollector
-from model import LlamaLM
 from einops import rearrange
 from transformers import PreTrainedTokenizer, AutoTokenizer
+
+import os
+import sys
+
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parent_dir)
+
+from debug_collector import DebugCollector
 from load_checkpoint import load_model
+from kv_cache import KVCache
+from model import LlamaLM
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
