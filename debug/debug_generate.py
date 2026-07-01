@@ -1,10 +1,21 @@
+"""
+Debug script when working on checkpoint loading milestone.
+"""
+
 import torch
-import model
 import logging
-from model import LlamaLM
 from einops import rearrange
 from transformers import PreTrainedTokenizer, AutoTokenizer
+
+import os
+import sys
+
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parent_dir)
+
 from load_checkpoint import load_model
+import model
+from model import LlamaLM
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
