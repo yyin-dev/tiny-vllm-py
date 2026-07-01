@@ -8,8 +8,16 @@ dependencies = [
     "einops>=0.8.2",
     "einx[torch]>=0.4.3",
     "jaxtyping>=0.3.11",
+    "pytest>=9.1.1",
     "safetensors>=0.8.0",
     "torch>=2.12.1",
     "torchtune>=0.6.1",
     "transformers>=5.12.1",
+]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
 ]
