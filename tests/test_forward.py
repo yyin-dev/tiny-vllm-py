@@ -274,14 +274,6 @@ def test_milestone2_kv_cache_generate(local_model, reference_model, tokenizer, d
             use_kv_cache=True,
         )
 
-        # NOTE: From a correctness perspective, KV-cache shouldn't change
-        # generation output. However, I observed that the reference model
-        # generates different result when kv-cache is enabled. I could be
-        # due to things like kv-cache implementation bug, numerical instability
-        # on MacOS hardware, etc, but I didn't investigate.
-        #
-        # For our purpose, set [use_cache=False] because HF's uncached
-        # generate() is more stable as a correctness reference.
         ref_res = reference_model.generate(
             encoded,
             attention_mask=attention_mask,
@@ -290,7 +282,7 @@ def test_milestone2_kv_cache_generate(local_model, reference_model, tokenizer, d
             temperature=1.0,
             eos_token_id=tokenizer.eos_token_id,
             do_sample=False,
-            use_cache=False,
+            use_cache=True,
         )[:, prompt_length:][0]
 
     print(local_res)

@@ -49,6 +49,12 @@ def reference_model(device: str) -> LlamaForCausalLM:
     )
     model = model.to(device).eval()
     logger.info("Finished loading reference model")
+
+    # When running on MPS, upcast to fp32 to avoid
+    # bf16 precision issue. See debug/debug_hf_generate.py for details.
+    if device == "mps":
+        model = model.float()
+
     return model
 
 
