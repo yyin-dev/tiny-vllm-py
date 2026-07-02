@@ -42,6 +42,15 @@ MAX_ABS_DIFF_THRESHOLD = 0.25
 MEAN_ABS_DIFF_THRESHOLD = 0.1
 
 
+def print_diff(name: str, a: torch.Tensor, b: torch.Tensor) -> None:
+    if a.shape == b.shape:
+        print(
+            f"{name}: max_abs={util.max_abs_diff(a, b):.6f}, mean_abs={util.mean_abs_diff(a, b):.6f}, shape={a.shape}"
+        )
+    else:
+        print(f"{name}: shape mismatch! {a.shape} != {b.shape}")
+
+
 def assert_allclose(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -289,6 +298,52 @@ def test_milestone2_kv_cache_generate(local_model, reference_model, tokenizer, d
     print(ref_res)
     assert local_res.shape == ref_res.shape
     assert torch.equal(local_res.to(ref_res.device), ref_res)
+
+
+def test_milestone3_static_batching_no_cache_no_position_ids_logits(
+    local_model, tokenizer, device
+):
+    input = ["Hi! How are you?"]
+
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+    # When batch encode using `tokenizer(input)`:
+    # If `input` is a single string, the resulting input_ids is a list[int]
+    # If `input` is a list of string, the resulting input_ids is a list[list[int]]
+
+    # pad to fixed length
+    padded = tokenizer(
+        input,
+        padding="max_length",
+        max_length=16,
+        truncation=True,
+        padding_side="left",
+        device=device,
+        return_attention_mask=True,
+    )
+
+    unpadded = tokenizer(input, device=device, return_attention_mask=True)
+    padded_last_logits = local_model(
+        torch.tensor(padded.input_ids, device=device),
+        attn_mask=torch.tensor(padded.attention_mask, device=device).bool(),
+    )[:, -1]
+
+    unpadded_last_logits = local_model(
+        torch.tensor(unpadded.input_ids, device=device),
+        attn_mask=torch.tensor(unpadded.attention_mask, device=device).bool(),
+    )[:, -1]
+
+    # When the prompt isn't padded, the physical position is the same as
+    # logical positions, so it's ok to not pass in position ids.
+    #
+    # When the prompt is padded, we need to pass logical
+    # position ids to forward() because it differs from physical position ids.
+    # O/w we would be using wrong positions for RoPE.
+    #
+    # However, the logits are very close. The theory is that the relative
+    # positions between tokens are the same and RoPE can handle
+    # shifts well.
+    print_diff("last_logits", padded_last_logits, unpadded_last_logits)
 
 
 def test_milestone3_static_batching_no_cache_generate(
