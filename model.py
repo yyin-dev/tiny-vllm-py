@@ -189,6 +189,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         kv_cache: KVCache | None = None,
         debug_collector: DebugCollector | None = None,
         attn_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> Float[Tensor, " ... seq d_v"]:
         """
         Args:
@@ -224,7 +225,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 debug_collector.record(self.layer_idx, "v_for_attn", V)
 
             if self.positional_encoder is not None:  # RoPE is enabled
-                cos, sin = self.positional_encoder(Q)
+                cos, sin = self.positional_encoder(Q, position_ids=position_ids)
                 Q, K = apply_rotary_pos_emb(Q, K, cos, sin)
                 if debug_collector:
                     debug_collector.record(self.layer_idx, "q_post_rope", Q)
@@ -277,7 +278,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 )
 
             if self.positional_encoder is not None:
-                cos, sin = self.positional_encoder(Q, token_positions)
+                # TODO: use [position_ids] passed in
+                cos, sin = self.positional_encoder(Q, position_ids=token_positions)
                 Q, current_token_k = apply_rotary_pos_emb(Q, current_token_k, cos, sin)
                 if debug_collector:
                     debug_collector.record(self.layer_idx, "q_post_rope", Q)
@@ -368,6 +370,7 @@ class TransformerBlock(nn.Module):
         kv_cache: KVCache | None = None,
         debug_collector: DebugCollector | None = None,
         attn_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ):
         """
         Args:
@@ -386,6 +389,7 @@ class TransformerBlock(nn.Module):
             kv_cache=kv_cache,
             debug_collector=debug_collector,
             attn_mask=attn_mask,
+            position_ids=position_ids,
         )
         attn_sublayer_output = x + x_attn
 
@@ -489,6 +493,7 @@ class LlamaLM(nn.Module):
         kv_cache: KVCache | None = None,
         debug_collector: DebugCollector | None = None,
         attn_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> Float[Tensor, " ... sequence_length vocab_size"]:
         """
         Args:
@@ -513,6 +518,7 @@ class LlamaLM(nn.Module):
                 kv_cache=kv_cache,
                 debug_collector=debug_collector,
                 attn_mask=attn_mask,
+                position_ids=position_ids,
             )
 
         # (batch size, sequence_length, d_model)
@@ -556,6 +562,42 @@ class LlamaLM(nn.Module):
             )
 
         return next_token_id
+
+    def create_attn_mask_and_position_ids(
+        self,
+        valid_token_mask: Bool[Tensor, "batch seq"],
+        curr_seq_len: int,
+        prompt_seq_len: int,
+        device,
+    ) -> tuple[Bool[Tensor, "batch seq seq"], Int[Tensor, "batch seq"]]:
+        num_real_tokens = torch.sum(valid_token_mask, dim=-1, keepdim=True)  # (b, 1)
+
+        # construct attn mask
+        # It's important to use [prompt_seq_len]!
+        real_token_starting_idx = prompt_seq_len - num_real_tokens  # (b, 1)
+
+        column_indices = torch.arange(curr_seq_len, device=device)  # (seq,)
+
+        # [key_mask] is True when a key can be attended to.
+        key_mask = column_indices >= real_token_starting_idx  # (b, seq)
+
+        # Insert a new query dimension
+        # Broadcast along the query dimension when combining with the causal mask.
+        query_key_mask = rearrange(key_mask, "b k_seq -> b 1 k_seq")
+        causal_mask = torch.tril(
+            torch.ones((curr_seq_len, curr_seq_len), device=device)
+        ).bool()
+        attn_mask = query_key_mask & causal_mask
+
+        # Add a head dimension
+        attn_mask = rearrange(attn_mask, "b q_seq k_seq -> b 1 q_seq k_seq")
+
+        # construct position ids
+        position_ids = column_indices - real_token_starting_idx
+        invalid_mask = position_ids < 0
+        position_ids = torch.masked_fill(position_ids, invalid_mask, 0)
+
+        return attn_mask, position_ids
 
     @torch.no_grad()
     def generate(
@@ -601,6 +643,7 @@ class LlamaLM(nn.Module):
             valid_token_mask = rearrange(valid_token_mask, "seq_len -> 1 seq_len")
 
         batch_size = x.shape[0]
+        prompt_seq_len = x.shape[-1]
         is_finished = torch.zeros((batch_size, 1), device=x.device).bool()
 
         if use_kv_cache:
@@ -656,42 +699,23 @@ class LlamaLM(nn.Module):
             return torch.tensor(decode_results)
         else:
             print("Not using KV cache")
-            original_seq_len = x.size(-1)
 
             for i in range(max_new_tokens):
                 curr_seq_len = x.shape[-1]
 
+                # construct attn mask
                 if valid_token_mask is not None:
-                    num_real_tokens = torch.sum(
-                        valid_token_mask, dim=-1, keepdim=True
-                    )  # (b, 1)
-
-                    # It's important to use [original_seq_len]!
-                    real_token_starting_idx = (
-                        original_seq_len - num_real_tokens
-                    )  # (b, 1)
-
-                    column_indices = torch.arange(
-                        curr_seq_len, device=x.device
-                    )  # (seq,)
-
-                    # [key_mask] is True when a key can be attended to.
-                    key_mask = column_indices >= real_token_starting_idx  # (b, seq)
-
-                    # Insert a new query dimension
-                    # Broadcast along the query dimension when combining with the causal mask.
-                    query_key_mask = rearrange(key_mask, "b k_seq -> b 1 k_seq")
-                    causal_mask = torch.tril(
-                        torch.ones((curr_seq_len, curr_seq_len), device=x.device)
-                    ).bool()
-                    attn_mask = query_key_mask & causal_mask
-
-                    # Add a head dimension
-                    attn_mask = rearrange(attn_mask, "b q_seq k_seq -> b 1 q_seq k_seq")
+                    attn_mask, position_ids = self.create_attn_mask_and_position_ids(
+                        valid_token_mask, curr_seq_len, prompt_seq_len, x.device
+                    )
                 else:
                     attn_mask = None
+                    position_ids = None
 
-                # Take the last `context_length` tokens if the input is
+                if debug_collector:
+                    debug_collector.record(i, "attn_mask", attn_mask)
+                    debug_collector.record(i, "position_ids", position_ids)
+
                 # beyond the model's context length
                 x = (
                     x[:, -self.context_length :]
@@ -700,7 +724,9 @@ class LlamaLM(nn.Module):
                 )
 
                 # Get the logits from the model
-                logits = self.forward(x, attn_mask=attn_mask)  # (b, s, vocab_size)
+                logits = self.forward(
+                    x, attn_mask=attn_mask, position_ids=position_ids
+                )  # (b, s, vocab_size)
 
                 # Take the logits for the next token
                 next_token_logits = logits[:, -1]
@@ -721,7 +747,7 @@ class LlamaLM(nn.Module):
 
                 x = torch.cat((x, next_token_id), dim=-1)
 
-            return x[:, original_seq_len:]
+            return x[:, prompt_seq_len:]
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path: str):
