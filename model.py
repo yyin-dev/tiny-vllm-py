@@ -181,18 +181,20 @@ class CausalMultiHeadSelfAttention(nn.Module):
             positional_encoder  # RoPE
         )
 
-        self.layer_idx = layer_idx
+        self.layer_idx = layer_idx if layer_idx else 0
 
     def forward(
         self,
         x: Float[Tensor, " ... seq d_k"],
         kv_cache: KVCache | None = None,
         debug_collector: DebugCollector | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> Float[Tensor, " ... seq d_v"]:
         """
         Args:
             x: The input to perform multi-headed self-attention on.
             positional_ids: The positional indices along the sequence dimension of the input embeddings.
+            attn_mask: If passed in, use it as is for [scaled_dot_product_attention]
 
         Returns:
             Self-attention outputs.
@@ -231,7 +233,18 @@ class CausalMultiHeadSelfAttention(nn.Module):
             if kv_cache:
                 kv_cache.append_kvs(self.layer_idx, K, V)
 
-            is_causal = True
+            # [torch.nn.functional.scaled_dot_product_attention] takes either
+            # [is_causal=True] or [attn_mask], but not both.
+            if attn_mask is not None:
+                # Assumes that attn_mask already incorporates causal-ness.
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query=Q, key=K, value=V, enable_gqa=True, attn_mask=attn_mask
+                )
+            else:
+                # No attn_mask is passed in, use causal
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query=Q, key=K, value=V, enable_gqa=True, is_causal=True
+                )
         else:
             # decode
             # Q: (b num_heads 1 head_dim)
@@ -285,20 +298,15 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
             kv_cache.append_kvs(self.layer_idx, current_token_k, current_token_v)
 
-            is_causal = False
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=Q,
+                key=K,
+                value=V,
+                is_causal=False,
+                enable_gqa=True,
+            )
 
-        # Shape: (..., num_heads, sequence_length, d_k)
-        # Use [torch.nn.functional.scaled_dot_product_attention] to support GQA
-        # When is_causal=True, casaul mask is constructed internally
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query=Q,
-            key=K,
-            value=V,
-            is_causal=is_causal,
-            enable_gqa=True,
-        )
         if debug_collector:
-            debug_collector.record(self.layer_idx, "is_causal", is_causal)
             debug_collector.record(self.layer_idx, "attn_output_heads", attn_output)
 
         # Concatenate the attention output from all heads.
@@ -359,6 +367,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         kv_cache: KVCache | None = None,
         debug_collector: DebugCollector | None = None,
+        attn_mask: torch.Tensor | None = None,
     ):
         """
         Args:
@@ -373,7 +382,10 @@ class TransformerBlock(nn.Module):
 
         # Apply the multi-head self-attention sublayer
         x_attn = self.attn(
-            self.ln1(x), kv_cache=kv_cache, debug_collector=debug_collector
+            self.ln1(x),
+            kv_cache=kv_cache,
+            debug_collector=debug_collector,
+            attn_mask=attn_mask,
         )
         attn_sublayer_output = x + x_attn
 
@@ -476,6 +488,7 @@ class LlamaLM(nn.Module):
         x: Int[Tensor, " ... sequence_length"],
         kv_cache: KVCache | None = None,
         debug_collector: DebugCollector | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> Float[Tensor, " ... sequence_length vocab_size"]:
         """
         Args:
@@ -495,7 +508,12 @@ class LlamaLM(nn.Module):
 
         for layer in self.layers:
             # (batch size, sequence_length, d_model)
-            x = layer(x, kv_cache=kv_cache, debug_collector=debug_collector)
+            x = layer(
+                x,
+                kv_cache=kv_cache,
+                debug_collector=debug_collector,
+                attn_mask=attn_mask,
+            )
 
         # (batch size, sequence_length, d_model)
         x = self.ln_final(x)
@@ -546,15 +564,16 @@ class LlamaLM(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
-        eos_token_id: int | list[int] | None = None,
+        valid_token_mask: Bool[Tensor, ""] | None = None,
+        eos_token_id: int | None = None,
         do_sample: bool = False,
-        use_kv_cache: bool = True,
+        use_kv_cache: bool = False,
         kv_cache: KVCache | None = None,
         debug_collector: DebugCollector | None = None,
     ):
         """
         Args:
-            x: LongTensor of shape `(1, sequence_length,)` or `(sequence_length, )`.
+            x: LongTensor of shape `(b, sequence_length,)` or `(sequence_length, )`.
                 Input IDs to condition on when generating.
             max_new_tokens: int
                 Maximum number of tokens to generate.
@@ -562,19 +581,27 @@ class LlamaLM(nn.Module):
                 Temperature to use during generation.
             top_k: int
                 If provided, only sample from the `top_k` vocab items (by probability).
+            valid_token_mask:
+                `(b, sequence_length)`.
+                True if a token is a real token. False if it's a padding token.
+                If not provided, assume all tokens are valid.
             eos_token_id: int
                 If provided, stop generation when we generate this ID.
 
         Returns: A LongTensor of shape (max_new_tokens,) with the generated model output.
         """
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
+        if valid_token_mask is not None:
+            assert valid_token_mask.shape == x.shape
 
-        def should_end_generation(next_token_id: Tensor):
-            eos_token_ids = (
-                eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
-            )
-            return next_token_id.item() in eos_token_ids
+        # Add batch dim if not present
+        if x.dim() == 1:
+            x = rearrange(x, "seq_len -> 1 seq_len")
+
+        if valid_token_mask is not None and valid_token_mask.dim() == 1:
+            valid_token_mask = rearrange(valid_token_mask, "seq_len -> 1 seq_len")
+
+        batch_size = x.shape[0]
+        is_finished = torch.zeros((batch_size, 1), device=x.device).bool()
 
         if use_kv_cache:
             if kv_cache is None:
@@ -614,7 +641,13 @@ class LlamaLM(nn.Module):
                 )
 
                 # End generation if we see the EOS token ID
-                if should_end_generation(next_token_id):
+                if eos_token_id:
+                    finished_at_this_step = next_token_id == eos_token_id
+                else:
+                    finished_at_this_step = torch.zeros_like(next_token_id).bool()
+
+                is_finished = is_finished | finished_at_this_step
+                if is_finished.all():
                     break
 
                 decode_results.append(next_token_id)
@@ -622,8 +655,42 @@ class LlamaLM(nn.Module):
             print("Decode phase done!")
             return torch.tensor(decode_results)
         else:
-            original_sequence_length = x.size(-1)
-            for _ in range(max_new_tokens):
+            print("Not using KV cache")
+            original_seq_len = x.size(-1)
+
+            for i in range(max_new_tokens):
+                curr_seq_len = x.shape[-1]
+
+                if valid_token_mask is not None:
+                    num_real_tokens = torch.sum(
+                        valid_token_mask, dim=-1, keepdim=True
+                    )  # (b, 1)
+
+                    # It's important to use [original_seq_len]!
+                    real_token_starting_idx = (
+                        original_seq_len - num_real_tokens
+                    )  # (b, 1)
+
+                    column_indices = torch.arange(
+                        curr_seq_len, device=x.device
+                    )  # (seq,)
+
+                    # [key_mask] is True when a key can be attended to.
+                    key_mask = column_indices >= real_token_starting_idx  # (b, seq)
+
+                    # Insert a new query dimension
+                    # Broadcast along the query dimension when combining with the causal mask.
+                    query_key_mask = rearrange(key_mask, "b k_seq -> b 1 k_seq")
+                    causal_mask = torch.tril(
+                        torch.ones((curr_seq_len, curr_seq_len), device=x.device)
+                    ).bool()
+                    attn_mask = query_key_mask & causal_mask
+
+                    # Add a head dimension
+                    attn_mask = rearrange(attn_mask, "b q_seq k_seq -> b 1 q_seq k_seq")
+                else:
+                    attn_mask = None
+
                 # Take the last `context_length` tokens if the input is
                 # beyond the model's context length
                 x = (
@@ -633,7 +700,7 @@ class LlamaLM(nn.Module):
                 )
 
                 # Get the logits from the model
-                logits = self.forward(x)
+                logits = self.forward(x, attn_mask=attn_mask)  # (b, s, vocab_size)
 
                 # Take the logits for the next token
                 next_token_logits = logits[:, -1]
@@ -643,12 +710,18 @@ class LlamaLM(nn.Module):
                 )
 
                 # End generation if we see the EOS token ID
-                if should_end_generation(next_token_id):
+                if eos_token_id:
+                    finished_at_this_step = next_token_id == eos_token_id
+                else:
+                    finished_at_this_step = torch.zeros_like(next_token_id).bool()
+
+                is_finished = is_finished | finished_at_this_step
+                if is_finished.all():
                     break
 
                 x = torch.cat((x, next_token_id), dim=-1)
 
-            return x[:, original_sequence_length:]
+            return x[:, original_seq_len:]
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path: str):
