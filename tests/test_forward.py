@@ -292,7 +292,7 @@ def test_milestone2_kv_cache_generate(local_model, reference_model, tokenizer, d
             eos_token_id=tokenizer.eos_token_id,
             do_sample=False,
             use_cache=True,
-        )[:, prompt_length:][0]
+        )[:, prompt_length:]
 
     print(local_res)
     print(ref_res)

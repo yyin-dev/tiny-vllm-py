@@ -529,7 +529,7 @@ class LlamaLM(nn.Module):
 
     def generate_one_token(
         self,
-        logits,
+        logits: Float[Tensor, "b 1"],
         temperature: float = 1.0,
         top_k: int | None = None,
         do_sample: bool = False,
@@ -563,23 +563,16 @@ class LlamaLM(nn.Module):
 
         return next_token_id
 
-    def create_attn_mask_and_position_ids(
+    def attn_mask_and_position_ids_for_prefix(
         self,
-        valid_token_mask: Bool[Tensor, "batch seq"],
+        num_padding_tokens: Int[Tensor, "b 1"],
         curr_seq_len: int,
-        prompt_seq_len: int,
         device,
     ) -> tuple[Bool[Tensor, "batch seq seq"], Int[Tensor, "batch seq"]]:
-        num_real_tokens = torch.sum(valid_token_mask, dim=-1, keepdim=True)  # (b, 1)
-
-        # construct attn mask
-        # It's important to use [prompt_seq_len]!
-        real_token_starting_idx = prompt_seq_len - num_real_tokens  # (b, 1)
-
         column_indices = torch.arange(curr_seq_len, device=device)  # (seq,)
 
         # [key_mask] is True when a key can be attended to.
-        key_mask = column_indices >= real_token_starting_idx  # (b, seq)
+        key_mask = column_indices >= num_padding_tokens  # (b, seq)
 
         # Insert a new query dimension
         # Broadcast along the query dimension when combining with the causal mask.
@@ -593,7 +586,7 @@ class LlamaLM(nn.Module):
         attn_mask = rearrange(attn_mask, "b q_seq k_seq -> b 1 q_seq k_seq")
 
         # construct position ids
-        position_ids = column_indices - real_token_starting_idx
+        position_ids = column_indices - num_padding_tokens
         invalid_mask = position_ids < 0
         position_ids = torch.masked_fill(position_ids, invalid_mask, 0)
 
@@ -646,108 +639,93 @@ class LlamaLM(nn.Module):
         prompt_seq_len = x.shape[-1]
         is_finished = torch.zeros((batch_size, 1), device=x.device).bool()
 
-        if use_kv_cache:
-            if kv_cache is None:
-                kv_cache = KVCache()
+        if use_kv_cache and kv_cache is None:
+            kv_cache = KVCache()
 
-            if debug_collector:
-                debug_collector.set_prefill()
+        print("Prefilling/Step 0 starts")
 
-            # prefill
-            print("Prefilling phase starts!")
-            prefill_logits = self.forward(
-                x, kv_cache=kv_cache, debug_collector=debug_collector
+        if valid_token_mask is None:
+            num_valid_tokens = torch.full(
+                (batch_size, 1), prompt_seq_len, device=x.device
             )
-            next_token_logits = prefill_logits[:, -1]
-            next_token_id = self.generate_one_token(
-                next_token_logits, temperature, top_k, do_sample
-            )
-            print("Prefilling phase done!")
+        else:
+            num_valid_tokens = torch.sum(
+                valid_token_mask, dim=-1, keepdim=True
+            )  # (b, 1)
 
-            # decode
-            print("Decode phase starts!")
-            decode_results = [next_token_id]
-            for step_idx in range(max_new_tokens - 1):
-                prev_token = torch.tensor([next_token_id], device=x.device)
-                prev_token = rearrange(prev_token, "(b s) -> b s", b=1, s=1)
+        num_padding_tokens = prompt_seq_len - num_valid_tokens
 
-                if debug_collector:
-                    debug_collector.set_decode_step(step_idx)
+        attn_mask, position_ids = self.attn_mask_and_position_ids_for_prefix(
+            num_padding_tokens=num_padding_tokens,
+            curr_seq_len=prompt_seq_len,
+            device=x.device,
+        )
 
-                decode_logits = self.forward(
+        prefill_logits = self.forward(
+            x,
+            kv_cache=kv_cache,
+            debug_collector=debug_collector,
+            attn_mask=attn_mask,
+            position_ids=position_ids,
+        )
+        next_token_logits = prefill_logits[:, -1]
+        next_token_id = self.generate_one_token(
+            next_token_logits, temperature, top_k, do_sample
+        )
+        print("Prefilling/Step 0 finished")
+
+        assert next_token_id.dim() == 2
+        generated_tokens = next_token_id  # (b, 1)
+
+        for step in range(max_new_tokens - 1):
+            if kv_cache:
+                prev_token = generated_tokens[:, -1:]
+
+                logits = self.forward(
                     prev_token, kv_cache=kv_cache, debug_collector=debug_collector
                 )
-                next_token_logits = decode_logits[:, -1]
-
-                next_token_id = self.generate_one_token(
-                    next_token_logits, temperature, top_k, do_sample
-                )
-
-                # End generation if we see the EOS token ID
-                if eos_token_id:
-                    finished_at_this_step = next_token_id == eos_token_id
-                else:
-                    finished_at_this_step = torch.zeros_like(next_token_id).bool()
-
-                is_finished = is_finished | finished_at_this_step
-                if is_finished.all():
-                    break
-
-                decode_results.append(next_token_id)
-
-            print("Decode phase done!")
-            return torch.tensor(decode_results)
-        else:
-            print("Not using KV cache")
-
-            for i in range(max_new_tokens):
-                curr_seq_len = x.shape[-1]
-
-                # construct attn mask
-                if valid_token_mask is not None:
-                    attn_mask, position_ids = self.create_attn_mask_and_position_ids(
-                        valid_token_mask, curr_seq_len, prompt_seq_len, x.device
-                    )
-                else:
-                    attn_mask = None
-                    position_ids = None
-
-                if debug_collector:
-                    debug_collector.record(i, "attn_mask", attn_mask)
-                    debug_collector.record(i, "position_ids", position_ids)
+            else:
+                full_prefix = torch.cat([x, generated_tokens], dim=-1)
 
                 # beyond the model's context length
-                x = (
-                    x[:, -self.context_length :]
-                    if x.size(1) > self.context_length
-                    else x
+                if full_prefix.shape[-1] > self.context_length:
+                    shift = full_prefix.shape[-1] - self.context_length
+                    num_padding_tokens = num_padding_tokens - shift
+                    full_prefix = full_prefix[:, -self.context_length :]
+
+                attn_mask, position_ids = self.attn_mask_and_position_ids_for_prefix(
+                    num_padding_tokens,
+                    curr_seq_len=full_prefix.shape[-1],
+                    device=x.device,
                 )
 
-                # Get the logits from the model
                 logits = self.forward(
-                    x, attn_mask=attn_mask, position_ids=position_ids
+                    full_prefix,
+                    attn_mask=attn_mask,
+                    position_ids=position_ids,
+                    debug_collector=debug_collector,
                 )  # (b, s, vocab_size)
 
-                # Take the logits for the next token
-                next_token_logits = logits[:, -1]
+            next_token_logits = logits[:, -1]
+            next_token_id = self.generate_one_token(
+                next_token_logits,
+                temperature=temperature,
+                top_k=top_k,
+                do_sample=do_sample,
+            )
 
-                next_token_id = self.generate_one_token(
-                    next_token_logits, temperature, top_k, do_sample
-                )
+            generated_tokens = torch.cat([generated_tokens, next_token_id], dim=-1)
 
-                # End generation if we see the EOS token ID
-                if eos_token_id:
-                    finished_at_this_step = next_token_id == eos_token_id
-                else:
-                    finished_at_this_step = torch.zeros_like(next_token_id).bool()
+            if eos_token_id:
+                finished_at_this_step = next_token_id == eos_token_id
+            else:
+                finished_at_this_step = torch.zeros_like(next_token_id).bool()
 
-                is_finished = is_finished | finished_at_this_step
-                if is_finished.all():
-                    break
+            is_finished = is_finished | finished_at_this_step
+            if is_finished.all():
+                break
 
-                x = torch.cat((x, next_token_id), dim=-1)
-
-            return x[:, prompt_seq_len:]
+        return generated_tokens
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path: str):
