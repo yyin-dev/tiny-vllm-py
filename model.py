@@ -571,32 +571,71 @@ class LlamaLM(nn.Module):
 
         return next_token_id
 
-    def attn_mask_and_position_ids_for_prefix(
+    def attn_mask_and_position_ids(
         self,
         num_padding_tokens: Int[Tensor, "b 1"],
-        curr_seq_len: int,
-        device,
-    ) -> tuple[Bool[Tensor, "batch seq seq"], Int[Tensor, "batch seq"]]:
-        column_indices = torch.arange(curr_seq_len, device=device)  # (seq,)
+        logical_length: Int[Tensor, "b 1"],
+        physical_length: int,
+        query_physical_idx_start: int,
+        query_physical_idx_end: int,
+    ):
+        """
+        Returns (`attn_mask`, `position_ids`) for static batching, where:
+        - `attn_mask` is (b, 1, q_seq, k_seq), where `q_seq = query_physical_idx_end - query_physical_idx_start`
+        and `k_seq = logical_length`. This represents the key positions
+        that can be attended to, for each query position.
+        - `position_ids` is (b, q_seq). This represents the logical query positions.
 
-        # [key_mask] is True when a key can be attended to.
-        key_mask = column_indices >= num_padding_tokens  # (b, seq)
+        When KV cache is enabled, `q_seq` is either `physical_length` or 1.
+        """
 
-        # Insert a new query dimension
-        # Broadcast along the query dimension when combining with the causal mask.
-        query_key_mask = rearrange(key_mask, "b k_seq -> b 1 k_seq")
-        causal_mask = torch.tril(
-            torch.ones((curr_seq_len, curr_seq_len), device=device)
-        ).bool()
-        attn_mask = query_key_mask & causal_mask
+        # Attention mask is constructed from two things:
+        # 1. A mask that masks out invalid token positions. This includes padding
+        # tokens and inactive tokens after EOS.
+        # 2. A causal mask.
+        #
+        # Position ids is basically logical index, clamped between 0 and `logical length - 1`.
+        # This padding tokens get position id of 0, and inactive tokens after EOS
+        # gets position id of `logical lenght - 1`.
 
-        # Add a head dimension
+        # Find out physical indices that can be attended to
+        key_physical_indices = torch.arange(
+            physical_length,
+            device=num_padding_tokens.device,
+        )  # (k_seq,)
+        key_logical_indices = key_physical_indices - num_padding_tokens  # (b, k_seq)
+        is_not_padding = key_logical_indices >= 0  # (b, k_seq)
+        is_not_finished = key_logical_indices < logical_length  # (b, k_seq)
+        key_attn_mask = is_not_padding & is_not_finished  # (b, k_seq)
+        key_attn_mask = rearrange(key_attn_mask, "b k_seq -> b 1 k_seq")
+
+        # Causal mask
+        query_physical_indices = torch.arange(
+            start=query_physical_idx_start,
+            end=query_physical_idx_end,
+            device=num_padding_tokens.device,
+        )  # (q_seq,)
+
+        key_physical_indices = torch.arange(
+            physical_length, device=num_padding_tokens.device
+        )
+
+        causal_mask = rearrange(
+            key_physical_indices, "k_seq -> 1 1 k_seq"
+        ) <= rearrange(
+            query_physical_indices, "q_seq -> 1 q_seq 1"
+        )  # (1, q_seq, k_seq)
+
+        # attn mask (b, q_seq, k_seq)
+        attn_mask = causal_mask & key_attn_mask
         attn_mask = rearrange(attn_mask, "b q_seq k_seq -> b 1 q_seq k_seq")
 
-        # construct position ids
-        position_ids = column_indices - num_padding_tokens
-        invalid_mask = position_ids < 0
-        position_ids = torch.masked_fill(position_ids, invalid_mask, 0)
+        query_logical_indices = query_physical_indices - num_padding_tokens  # (b, seq)
+        position_ids = torch.clamp(
+            query_logical_indices,
+            torch.zeros_like(logical_length),
+            logical_length - 1,
+        )
 
         return attn_mask, position_ids
 
@@ -652,29 +691,30 @@ class LlamaLM(nn.Module):
             valid_token_mask = rearrange(valid_token_mask, "seq_len -> 1 seq_len")
 
         batch_size = x.shape[0]
-        prompt_seq_len = x.shape[-1]
-        is_finished = torch.zeros((batch_size, 1), device=x.device).bool()
+        prompt_len = x.shape[-1]
 
         if use_kv_cache and kv_cache is None:
             kv_cache = KVCache()
 
         print("Prefilling/Step 0 starts")
 
+        # loop state
+        is_finished = torch.zeros((batch_size, 1), device=x.device).bool()
         if valid_token_mask is None:
-            num_valid_tokens = torch.full(
-                (batch_size, 1), prompt_seq_len, device=x.device
-            )
+            logical_length = torch.full((batch_size, 1), prompt_len, device=x.device)
         else:
-            num_valid_tokens = torch.sum(
-                valid_token_mask, dim=-1, keepdim=True
-            )  # (b, 1)
+            logical_length = torch.sum(valid_token_mask, dim=-1, keepdim=True)  # (b, 1)
+        num_padding_tokens = prompt_len - logical_length
+        print("logical length before prefill")
+        print(logical_length)
 
-        num_padding_tokens = prompt_seq_len - num_valid_tokens
-
-        attn_mask, position_ids = self.attn_mask_and_position_ids_for_prefix(
+        # prefill
+        attn_mask, position_ids = self.attn_mask_and_position_ids(
             num_padding_tokens=num_padding_tokens,
-            curr_seq_len=prompt_seq_len,
-            device=x.device,
+            logical_length=logical_length,
+            physical_length=prompt_len,
+            query_physical_idx_start=0,
+            query_physical_idx_end=prompt_len,
         )
 
         prefill_logits = self.forward(
@@ -689,29 +729,32 @@ class LlamaLM(nn.Module):
         next_token_id = self.generate_one_token(
             next_token_logits, temperature, top_k, do_sample
         )
-        print("Prefilling/Step 0 finished")
+
+        if eos_token_id:
+            is_finished = next_token_id == eos_token_id
+            logical_length[~is_finished] += 1
+        else:
+            logical_length += 1
 
         assert next_token_id.dim() == 2
         generated_tokens = next_token_id  # (b, 1)
 
+        # decode
         for step in range(max_new_tokens - 1):
+            print(f"Decode step {step}")
             if kv_cache:
                 prev_token = generated_tokens[:, -1:]
 
                 seq_len = x.shape[-1] + generated_tokens.shape[-1]
 
                 # attn mask: (b, 1, seq)
-                column_indices = torch.arange(seq_len, device=x.device)  # (seq,)
-                key_mask = column_indices >= num_padding_tokens  # (b, seq)
-                attn_mask = rearrange(key_mask, "b seq -> b 1 1 seq")
-
-                # position ids: (b, seq)
-                #
-                # During decode, the position id should be the the position
-                # id of the last token in the logical sequence.
-                physical_length = torch.tensor([[seq_len]], device=x.device)
-                logical_length = physical_length - num_padding_tokens
-                position_ids = logical_length - 1
+                attn_mask, position_ids = self.attn_mask_and_position_ids(
+                    num_padding_tokens,
+                    logical_length=logical_length,
+                    physical_length=seq_len,
+                    query_physical_idx_start=seq_len - 1,
+                    query_physical_idx_end=seq_len,
+                )
 
                 logits = self.forward(
                     prev_token,
@@ -723,17 +766,23 @@ class LlamaLM(nn.Module):
             else:
                 full_prefix = torch.cat([x, generated_tokens], dim=-1)
 
-                # beyond the model's context length
-                if full_prefix.shape[-1] > self.context_length:
-                    shift = full_prefix.shape[-1] - self.context_length
-                    num_padding_tokens = num_padding_tokens - shift
-                    full_prefix = full_prefix[:, -self.context_length :]
-
-                attn_mask, position_ids = self.attn_mask_and_position_ids_for_prefix(
-                    num_padding_tokens,
-                    curr_seq_len=full_prefix.shape[-1],
-                    device=x.device,
+                curr_seq_len = full_prefix.shape[-1]
+                attn_mask, position_ids = self.attn_mask_and_position_ids(
+                    num_padding_tokens=num_padding_tokens,
+                    logical_length=logical_length,
+                    physical_length=curr_seq_len,
+                    query_physical_idx_start=0,
+                    query_physical_idx_end=curr_seq_len,
                 )
+
+                # beyond the model's context length
+                # need to truncate all: query dim, key dim, and position_ids
+                if full_prefix.shape[-1] > self.context_length:
+                    full_prefix = full_prefix[:, -self.context_length :]
+                    attn_mask = attn_mask[
+                        :, :, -self.context_length :, -self.context_length :
+                    ]
+                    position_ids = position_ids[:, -self.context_length :]
 
                 logits = self.forward(
                     full_prefix,
@@ -757,6 +806,8 @@ class LlamaLM(nn.Module):
                 finished_at_this_step = next_token_id == eos_token_id
             else:
                 finished_at_this_step = torch.zeros_like(next_token_id).bool()
+
+            logical_length[~finished_at_this_step] += 1
 
             is_finished = is_finished | finished_at_this_step
             if is_finished.all():

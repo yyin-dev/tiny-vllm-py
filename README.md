@@ -145,6 +145,10 @@ The core of implementing static batching is just:
 * Maintain the `attn_mask` and `position_ids` correctly in `generate()`
 * Update self-attention module to use the two arguments appropriately
 
+In static batching, correctness should be defined at the level of the **logical sequence**, not the full physical batch tensor. *Active slot*s correspond to real logical sequences and should behave exactly the same as singleton generation. When a sequence produces EOS, it may still remain in the physical batch for shape alignment, but subsequent slots for that row are *inactive slot*s rather than part of the logical sequence. 
+
+For these inactive slots, we do not make a semantic guarantee about the tokens or logits produced. The only important requirement is that active sequences continue to behave correctly. Under this weaker semantic, a simple implementation that keeps advancing physical positions after EOS can still be acceptable. A stricter implementation may additionally freeze position ids and prevent inactive slots from being attended to, but that is an implementation choice rather than a required part of the semantic contract.
+
 ## Directory Structure
 - `tests/`: testcases. Runnable throughout the project.
 - `debug/`: debug scripts when working on milestones. Expected to be runnable at the commit it's created or updated, but later commits might break it.
