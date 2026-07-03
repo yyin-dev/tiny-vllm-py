@@ -313,38 +313,44 @@ def test_milestone3_static_batching_no_cache_logits(local_model, tokenizer, devi
     padded = tokenizer(
         input,
         padding="max_length",
-        max_length=16,
+        max_length=8,
         truncation=True,
         padding_side="left",
         device=device,
         return_attention_mask=True,
     )
 
-    unpadded = tokenizer(input, device=device, return_attention_mask=True)
+    padded_input_ids = torch.tensor(padded.input_ids, device=device)
+    valid_token_mask = torch.tensor(padded.attention_mask, device=device)
 
-    padded_attn_mask = torch.tensor(padded.attention_mask, device=device).bool()
+    seq_len_tensor = torch.tensor(
+        [[padded_input_ids.shape[-1]]], device=valid_token_mask.device
+    )
+    num_valid_tokens = torch.sum(valid_token_mask, dim=-1, keepdim=True)
+    num_padding_tokens = seq_len_tensor - num_valid_tokens
+
+    attn_mask_padded, position_ids_padded = (
+        local_model.attn_mask_and_position_ids_for_prefix(
+            num_padding_tokens,
+            curr_seq_len=padded_input_ids.shape[-1],
+            device=padded_input_ids.device,
+        )
+    )
+
     padded_last_logits = local_model(
-        torch.tensor(padded.input_ids, device=device),
-        attn_mask=padded_attn_mask,
+        padded_input_ids,
+        attn_mask=attn_mask_padded,
     )[:, -1]
-
-    prompt_len = padded_attn_mask.shape[-1]
-    num_real_tokens = torch.sum(padded_attn_mask, dim=-1, keepdim=True)  # (b, 1)
-    real_token_starting_idx = prompt_len - num_real_tokens  # (b, 1)
-    column_indices = torch.arange(prompt_len, device=device)  # (seq,)
-    position_ids = column_indices - real_token_starting_idx
-    invalid_mask = position_ids < 0
-    position_ids = torch.masked_fill(position_ids, invalid_mask, 0)
 
     padded_w_position_ids_last_logits = local_model(
-        torch.tensor(padded.input_ids, device=device),
-        attn_mask=padded_attn_mask,
-        position_ids=position_ids,
+        padded_input_ids,
+        attn_mask=attn_mask_padded,
+        position_ids=position_ids_padded,
     )[:, -1]
 
+    unpadded = tokenizer(input, device=device, return_attention_mask=True)
     unpadded_last_logits = local_model(
         torch.tensor(unpadded.input_ids, device=device),
-        attn_mask=torch.tensor(unpadded.attention_mask, device=device).bool(),
     )[:, -1]
 
     # When the prompt isn't padded, the physical position is the same as
@@ -358,13 +364,17 @@ def test_milestone3_static_batching_no_cache_logits(local_model, tokenizer, devi
     # positions between tokens are the same and RoPE can handle
     # shifts well.
     print_diff(
-        "last_logits padded vs. unpadded", padded_last_logits, unpadded_last_logits
+        "last_logits padded vs. padded w/ position ids",
+        padded_last_logits,
+        padded_w_position_ids_last_logits,
     )
+    torch.testing.assert_close(padded_last_logits, padded_w_position_ids_last_logits)
     print_diff(
         "last_logits padded w/ position ids vs. unpadded",
         padded_w_position_ids_last_logits,
         unpadded_last_logits,
     )
+    torch.testing.assert_close(padded_w_position_ids_last_logits, unpadded_last_logits)
 
 
 def test_milestone3_static_batching_no_cache_generate(
