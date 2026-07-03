@@ -40,6 +40,13 @@ def local_model(device: str) -> LlamaLM:
 
 
 @pytest.fixture(scope="session")
+def local_model_cpu() -> LlamaLM:
+    model: LlamaLM = load_model()
+    model = model.to("cpu").eval()
+    return model
+
+
+@pytest.fixture(scope="session")
 def reference_model(device: str) -> LlamaForCausalLM:
     logger.info("Start loading reference model")
     model_name = "meta-llama/Llama-3.2-1B-Instruct"

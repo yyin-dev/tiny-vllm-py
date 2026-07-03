@@ -18,7 +18,8 @@ forward() logits are close but output tokens mismatch, it implies that the issue
 is in the generation loop.
 
 Checking logits is easy: just run forward() on local and reference model for
-one or more steps.
+one or more steps. On my M1 MackBook Air, MPS seems to introduce meaningful
+precision error, so I sometimes run on CPU when comparing logits.
 
 Checking tokens is more complicated. HuggingFace's generate() potentially
 contains other quirks that differ from vanilla implementation, making
@@ -40,6 +41,8 @@ from kv_cache import KVCache
 
 MAX_ABS_DIFF_THRESHOLD = 0.25
 MEAN_ABS_DIFF_THRESHOLD = 0.1
+TIGHT_MAX_ABS_DIFF_THRESHOLD = 1e-4
+TIGHT_MEAN_ABS_DIFF_THRESHOLD = 1e-5
 
 
 def print_diff(name: str, a: torch.Tensor, b: torch.Tensor) -> None:
@@ -54,12 +57,30 @@ def print_diff(name: str, a: torch.Tensor, b: torch.Tensor) -> None:
 def assert_allclose(
     a: torch.Tensor,
     b: torch.Tensor,
-    max_diff_tolerance=MAX_ABS_DIFF_THRESHOLD,
-    mean_diff_tolerance=MEAN_ABS_DIFF_THRESHOLD,
+    max_diff_tolerance,
+    mean_diff_tolerance,
 ):
     assert a.shape == b.shape
     assert util.max_abs_diff(a, b) < max_diff_tolerance
     assert util.mean_abs_diff(a, b) < mean_diff_tolerance
+
+
+def assert_allclose_loose(a: torch.Tensor, b: torch.Tensor):
+    assert_allclose(
+        a,
+        b,
+        max_diff_tolerance=MAX_ABS_DIFF_THRESHOLD,
+        mean_diff_tolerance=MEAN_ABS_DIFF_THRESHOLD,
+    )
+
+
+def assert_allclose_tight(a: torch.Tensor, b: torch.Tensor):
+    assert_allclose(
+        a,
+        b,
+        max_diff_tolerance=TIGHT_MAX_ABS_DIFF_THRESHOLD,
+        mean_diff_tolerance=TIGHT_MEAN_ABS_DIFF_THRESHOLD,
+    )
 
 
 def test_milestone1_single_step_logits(local_model, reference_model, tokenizer, device):
@@ -80,7 +101,7 @@ def test_milestone1_single_step_logits(local_model, reference_model, tokenizer, 
         assert max_prob_token_local == max_prob_token_reference
 
         # check numerical close
-        assert_allclose(last_logits_local, last_logits_reference)
+        assert_allclose_loose(last_logits_local, last_logits_reference)
 
 
 def test_milestone1_multi_steps_logits(local_model, reference_model, tokenizer, device):
@@ -96,7 +117,7 @@ def test_milestone1_multi_steps_logits(local_model, reference_model, tokenizer, 
         max_prob_token_local = torch.argmax(last_logits_local, dim=-1).item()
         max_prob_token_reference = torch.argmax(last_logits_reference, dim=-1).item()
         assert max_prob_token_local == max_prob_token_reference
-        assert_allclose(last_logits_local, last_logits_reference)
+        assert_allclose_loose(last_logits_local, last_logits_reference)
 
         encoded = torch.cat(
             [encoded, torch.tensor([[max_prob_token_local]], device=device)], dim=-1
@@ -136,8 +157,11 @@ def test_milestone1_multi_step_generate(
 
 
 def test_milestone2_kv_cache_multi_steps_logits_self_consistency(
-    local_model, tokenizer, device
+    local_model_cpu, tokenizer
 ):
+    model = local_model_cpu
+    device = "cpu"
+
     for input in [
         ["How are you?"],
         ["A really really really really long prompt"],
@@ -146,17 +170,17 @@ def test_milestone2_kv_cache_multi_steps_logits_self_consistency(
         encoded = torch.tensor(batch_encoding.input_ids, device=device)
 
         # Reference: without kv cache
-        ref_first_step_last_logits = local_model(encoded)[:, -1]
+        ref_first_step_last_logits = model(encoded)[:, -1]
         ref_first_step_token = torch.argmax(ref_first_step_last_logits, dim=-1).item()
 
         # With cache: Prefill
         kv_cache = KVCache()
-        prefill_last_logits = local_model(encoded, kv_cache=kv_cache)[:, -1]
+        prefill_last_logits = model(encoded, kv_cache=kv_cache)[:, -1]
         prefill_max_prob_token = torch.argmax(prefill_last_logits, dim=-1).item()
 
         # compare prefill result
         assert ref_first_step_token == prefill_max_prob_token
-        assert_allclose(ref_first_step_last_logits, prefill_last_logits)
+        assert_allclose_tight(ref_first_step_last_logits, prefill_last_logits)
 
         # decode
         steps = 8
@@ -166,20 +190,20 @@ def test_milestone2_kv_cache_multi_steps_logits_self_consistency(
         next_decode_step_input = torch.tensor([[prefill_max_prob_token]], device=device)
         for step in range(steps):
             # without cache
-            ref_last_logits = local_model(curr_prompt_and_decode_res)[:, -1]
+            ref_last_logits = model(curr_prompt_and_decode_res)[:, -1]
             ref_max_prob_token = torch.argmax(ref_last_logits, dim=-1).item()
 
             # with cache
-            decode_step_last_logits = local_model(
-                next_decode_step_input, kv_cache=kv_cache
-            )[:, -1]
+            decode_step_last_logits = model(next_decode_step_input, kv_cache=kv_cache)[
+                :, -1
+            ]
 
             decode_step_max_prob_token = torch.argmax(
                 decode_step_last_logits, dim=-1
             ).item()
 
             assert ref_max_prob_token == decode_step_max_prob_token
-            assert_allclose(ref_last_logits, decode_step_last_logits)
+            assert_allclose_tight(ref_last_logits, decode_step_last_logits)
 
             curr_prompt_and_decode_res = torch.cat(
                 [
@@ -217,7 +241,7 @@ def test_milestone2_kv_cache_multi_steps_logits(
             ).item()
 
             assert prefill_max_prob_token == ref_prefill_max_prob_token
-            assert_allclose(prefill_last_logits, ref_prefill_last_logits)
+            assert_allclose_loose(prefill_last_logits, ref_prefill_last_logits)
 
             # Keep the full logical prefix for the HF oracle and feed only the
             # newest token into the local cached decode path.
@@ -247,7 +271,7 @@ def test_milestone2_kv_cache_multi_steps_logits(
 
                 assert ref_max_prob_token == decode_step_max_prob_token
 
-                assert_allclose(
+                assert_allclose_loose(
                     ref_last_logits,
                     decode_step_last_logits,
                 )
@@ -300,10 +324,15 @@ def test_milestone2_kv_cache_generate(local_model, reference_model, tokenizer, d
     assert torch.equal(local_res.to(ref_res.device), ref_res)
 
 
-def test_milestone3_static_batching_no_cache_logits(local_model, tokenizer, device):
+def test_milestone3_static_batching_singleton_no_cache_logits(
+    local_model_cpu, tokenizer
+):
+    model = local_model_cpu
+    device = "cpu"
+
     input = ["Hi! How are you?"]
 
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    tokenizer.pad_token = tokenizer.eos_token
 
     # When batch encode using `tokenizer(input)`:
     # If `input` is a single string, the resulting input_ids is a list[int]
@@ -329,28 +358,37 @@ def test_milestone3_static_batching_no_cache_logits(local_model, tokenizer, devi
     num_valid_tokens = torch.sum(valid_token_mask, dim=-1, keepdim=True)
     num_padding_tokens = seq_len_tensor - num_valid_tokens
 
-    attn_mask_padded, position_ids_padded = (
-        local_model.attn_mask_and_position_ids_for_prefix(
-            num_padding_tokens,
-            curr_seq_len=padded_input_ids.shape[-1],
-            device=padded_input_ids.device,
-        )
+    attn_mask_padded, position_ids_padded = model.attn_mask_and_position_ids_for_prefix(
+        num_padding_tokens,
+        curr_seq_len=padded_input_ids.shape[-1],
+        device=padded_input_ids.device,
     )
 
-    padded_last_logits = local_model(
+    padded_last_logits = model(
         padded_input_ids,
         attn_mask=attn_mask_padded,
     )[:, -1]
 
-    padded_w_position_ids_last_logits = local_model(
+    padded_w_position_ids_last_logits = model(
         padded_input_ids,
         attn_mask=attn_mask_padded,
         position_ids=position_ids_padded,
     )[:, -1]
 
     unpadded = tokenizer(input, device=device, return_attention_mask=True)
-    unpadded_last_logits = local_model(
+    unpadded_input_ids = torch.tensor(unpadded.input_ids, device=device)
+    attn_mask_unpadded, positoin_ids_unpadded = (
+        model.attn_mask_and_position_ids_for_prefix(
+            num_padding_tokens=torch.zeros((1, 1), device=device),
+            curr_seq_len=unpadded_input_ids.shape[-1],
+            device=device,
+        )
+    )
+
+    unpadded_last_logits = model(
         torch.tensor(unpadded.input_ids, device=device),
+        attn_mask=attn_mask_unpadded,
+        position_ids=positoin_ids_unpadded,
     )[:, -1]
 
     # When the prompt isn't padded, the physical position is the same as
@@ -368,13 +406,12 @@ def test_milestone3_static_batching_no_cache_logits(local_model, tokenizer, devi
         padded_last_logits,
         padded_w_position_ids_last_logits,
     )
-    torch.testing.assert_close(padded_last_logits, padded_w_position_ids_last_logits)
     print_diff(
         "last_logits padded w/ position ids vs. unpadded",
         padded_w_position_ids_last_logits,
         unpadded_last_logits,
     )
-    torch.testing.assert_close(padded_w_position_ids_last_logits, unpadded_last_logits)
+    assert_allclose_tight(padded_w_position_ids_last_logits, unpadded_last_logits)
 
 
 def test_milestone3_static_batching_no_cache_generate(
@@ -444,3 +481,118 @@ def test_milestone3_static_batching_no_cache_generate(
 
     assert local_res.shape == ref_res.shape
     assert torch.equal(local_res, ref_res)
+
+
+# Compare <batched, kv cache> with <singleton, kv cache>
+def test_milestone3_static_batching_w_cache_self_consistency1(
+    local_model_cpu, tokenizer
+):
+    device = "cpu"
+    model = local_model_cpu
+
+    inputs = ["Hello!", "Hi! How are you?"]
+    decode_steps = 3
+
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # Step 0
+    # Batch
+    batch_encoding = tokenizer(
+        inputs,
+        padding=True,
+        padding_side="left",
+        device=device,
+        return_attention_mask=True,
+    )
+    batch_input_ids = torch.tensor(batch_encoding.input_ids, device=device)
+    attention_mask = torch.tensor(batch_encoding.attention_mask, device=device)
+
+    batched_generated_tokens, batched_step_logits = model.generate(
+        batch_input_ids,
+        max_new_tokens=decode_steps + 1,
+        do_sample=False,
+        valid_token_mask=attention_mask,
+        use_kv_cache=True,
+        return_logits=True,
+    )
+
+    for i in range(len(inputs)):
+        singleton_encoding = tokenizer([inputs[i]], return_attention_mask=True)
+        input_ids = torch.tensor(singleton_encoding.input_ids, device=device)
+        singleton_attention_mask = torch.tensor(
+            singleton_encoding.attention_mask, device=device
+        )
+
+        singleton_generated_tokens, singleton_step_logits = model.generate(
+            input_ids,
+            max_new_tokens=decode_steps + 1,
+            do_sample=False,
+            valid_token_mask=singleton_attention_mask,
+            use_kv_cache=True,
+            return_logits=True,
+        )
+
+        assert_allclose_tight(
+            batched_step_logits[i : i + 1],
+            singleton_step_logits,
+        )
+        assert torch.equal(
+            batched_generated_tokens[i : i + 1],
+            singleton_generated_tokens,
+        )
+
+
+# Compare <batched, kv cache> with <singleton, no cache>
+def test_milestone3_static_batching_w_cache_logits_self_consistency2(
+    local_model_cpu, tokenizer
+):
+    device = "cpu"
+    model = local_model_cpu
+
+    inputs = ["Hello!", "Hi! How are you?"]
+    decode_steps = 3
+
+    tokenizer.pad_token = tokenizer.eos_token
+
+    batch_encoding = tokenizer(
+        inputs,
+        padding=True,
+        padding_side="left",
+        device=device,
+        return_attention_mask=True,
+    )
+    batch_input_ids = torch.tensor(batch_encoding.input_ids, device=device)
+    attention_mask = torch.tensor(batch_encoding.attention_mask, device=device)
+
+    # Use the real batched cached generation path under test, and compare its
+    # per-step logits against a no-cache singleton generation oracle.
+    batched_generated_tokens, batched_step_logits = model.generate(
+        batch_input_ids,
+        max_new_tokens=decode_steps + 1,
+        do_sample=False,
+        valid_token_mask=attention_mask,
+        use_kv_cache=True,
+        return_logits=True,
+    )
+
+    for i in range(len(inputs)):
+        singleton_encoding = tokenizer([inputs[i]], return_attention_mask=True)
+        singleton_input_ids = torch.tensor(singleton_encoding.input_ids, device=device)
+        singleton_attention_mask = torch.tensor(
+            singleton_encoding.attention_mask, device=device
+        )
+
+        oracle_generated_tokens, oracle_step_logits = model.generate(
+            singleton_input_ids,
+            max_new_tokens=decode_steps + 1,
+            do_sample=False,
+            valid_token_mask=singleton_attention_mask,
+            use_kv_cache=False,
+            return_logits=True,
+        )
+
+        assert_allclose_tight(batched_step_logits[i : i + 1], oracle_step_logits)
+        assert torch.equal(
+            batched_generated_tokens[i : i + 1],
+            oracle_generated_tokens,
+        )

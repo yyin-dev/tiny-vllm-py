@@ -10,7 +10,7 @@ decode separation, KV cache management, and continuous batching.
 
 - [x] Checkpoint loading & Forward decode
 - [x] KV cache
-- [ ] Static batching
+- [x] Static batching
 - [ ] Continuous batching
 - [ ] Paged KV cache
 
@@ -75,7 +75,7 @@ KVCache:
     def current_length(self, layer_idx) -> int:
 ```
 
-At a high-level, what KV-cache really changes is just how you compute K/V in the attn block. In prefill, need to store K/V to the cache. In decode, compute Q/K/V only for the new token, and retrieve K/V prefix for previous tokens from the cache, construct the full K/V for the full sequence, then run the attention computation.
+**At a high-level, what KV-cache really changes is just how you compute K/V in the attn block**. In prefill, need to store K/V to the cache. In decode, compute Q/K/V only for the new token, and retrieve K/V prefix for previous tokens from the cache, construct the full K/V for the full sequence, then run the attention computation.
 
 For attention layer: 
 
@@ -104,12 +104,10 @@ Forward vs. Debug path mismatch.
 
 ## Static Batching
 
-Static batching means sequences in a batch advance in lock-step. The two immediate consequences are:
+The goal is to make batch inference produce result just like without batching. Static batching means sequences in a batch advance in lock-step. The consequences are:
 
 * During prefill, we need to pad sequences to the same length
-* During decode, some sequences already ended while others are still decoding
-
-The goal is to make batch inference produce result just like without batching. Similar to implementing KV-cache, the focus is still the self-attention: in decoder-only transformer, self-attention is the only operation that mixes information across sequence positions and thus requires handling things like padding tokens carefully. 
+* During decode, the position ids need to account for padding tokens. Also, some sequences already ended while others are still decoding
 
 For correctness, we need to distinguish "physical sequence" and "logical sequence". 
 
@@ -134,16 +132,18 @@ For now, we will implement Option 2 for simplicity.
 
 Self-attention needs two pieces of information to handle batching:
 
-* An attention mask that tells it the positions it can attend to. For example, attention shouldn't attend to PAD tokens. 
-* A `position_ids` that tells it the position of the current position in the **logical** sequence. 
+* An `attn_mask` that tells it the positions it can attend to. For example, attention shouldn't attend to PAD tokens. 
+* A `position_ids` that tells it the position of the current token in the **logical** sequence. 
 
 This means we need to track at least the following metadata:
 
-* `pad_offset[i]`: physical position of the last padding token
-* `logical_seq_len[i]`: length of the current logical sequence
+* `num_padding_tokens[i]`: number of padding tokens in each sequence
 * `is_finished[i]`: whether EOS has been generated for a sequence
 
-For sequence `i`, the physical positions in range `[pad_offset[i], pad_offset[i] + logical_seq_len[i])` are valid. Note that the range is left-closed, right-open. 
+The core of implementing static batching is just:
+
+* Maintain the `attn_mask` and `position_ids` correctly in `generate()`
+* Update self-attention module to use the two arguments appropriately
 
 ## Directory Structure
 - `tests/`: testcases. Runnable throughout the project.
