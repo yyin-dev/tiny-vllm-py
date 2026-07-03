@@ -269,17 +269,16 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 debug_collector.record(self.layer_idx, "v_current", current_token_v)
 
             # get token position from kv-cache length
-            token_positions = torch.tensor(
-                [[kv_cache.current_length(self.layer_idx)]], device=Q.device
-            )
-            if debug_collector:
-                debug_collector.record(
-                    self.layer_idx, "token_positions", token_positions
+            if position_ids is None:
+                position_ids = torch.tensor(
+                    [[kv_cache.current_length(self.layer_idx)]], device=Q.device
                 )
 
+            if debug_collector:
+                debug_collector.record(self.layer_idx, "token_positions", position_ids)
+
             if self.positional_encoder is not None:
-                # TODO: use [position_ids] passed in
-                cos, sin = self.positional_encoder(Q, position_ids=token_positions)
+                cos, sin = self.positional_encoder(Q, position_ids=position_ids)
                 Q, current_token_k = apply_rotary_pos_emb(Q, current_token_k, cos, sin)
                 if debug_collector:
                     debug_collector.record(self.layer_idx, "q_post_rope", Q)
@@ -300,13 +299,22 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
             kv_cache.append_kvs(self.layer_idx, current_token_k, current_token_v)
 
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query=Q,
-                key=K,
-                value=V,
-                is_causal=False,
-                enable_gqa=True,
-            )
+            if attn_mask is not None:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query=Q,
+                    key=K,
+                    value=V,
+                    attn_mask=attn_mask,
+                    enable_gqa=True,
+                )
+            else:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query=Q,
+                    key=K,
+                    value=V,
+                    is_causal=False,
+                    enable_gqa=True,
+                )
 
         if debug_collector:
             debug_collector.record(self.layer_idx, "attn_output_heads", attn_output)
@@ -605,6 +613,7 @@ class LlamaLM(nn.Module):
         use_kv_cache: bool = False,
         kv_cache: KVCache | None = None,
         debug_collector: DebugCollector | None = None,
+        return_logits: bool = False,
     ):
         """
         Args:
@@ -623,7 +632,14 @@ class LlamaLM(nn.Module):
             eos_token_id: int
                 If provided, stop generation when we generate this ID.
 
-        Returns: A LongTensor of shape (max_new_tokens,) with the generated model output.
+        Returns:
+            If [return_logits] is False, a LongTensor of shape
+            `(batch_size, generated_length)` with generated token IDs.
+
+            If [return_logits] is True, returns a tuple
+            `(generated_tokens, step_logits)`, where [step_logits] has shape
+            `(batch_size, generated_length, vocab_size)` and stores the
+            next-token logits used at each generation step.
         """
         if valid_token_mask is not None:
             assert valid_token_mask.shape == x.shape
@@ -669,6 +685,7 @@ class LlamaLM(nn.Module):
             position_ids=position_ids,
         )
         next_token_logits = prefill_logits[:, -1]
+        step_logits = [next_token_logits]
         next_token_id = self.generate_one_token(
             next_token_logits, temperature, top_k, do_sample
         )
@@ -681,8 +698,27 @@ class LlamaLM(nn.Module):
             if kv_cache:
                 prev_token = generated_tokens[:, -1:]
 
+                seq_len = x.shape[-1] + generated_tokens.shape[-1]
+
+                # attn mask: (b, 1, seq)
+                column_indices = torch.arange(seq_len, device=x.device)  # (seq,)
+                key_mask = column_indices >= num_padding_tokens  # (b, seq)
+                attn_mask = rearrange(key_mask, "b seq -> b 1 1 seq")
+
+                # position ids: (b, seq)
+                #
+                # During decode, the position id should be the the position
+                # id of the last token in the logical sequence.
+                physical_length = torch.tensor([[seq_len]], device=x.device)
+                logical_length = physical_length - num_padding_tokens
+                position_ids = logical_length - 1
+
                 logits = self.forward(
-                    prev_token, kv_cache=kv_cache, debug_collector=debug_collector
+                    prev_token,
+                    kv_cache=kv_cache,
+                    attn_mask=attn_mask,
+                    position_ids=position_ids,
+                    debug_collector=debug_collector,
                 )
             else:
                 full_prefix = torch.cat([x, generated_tokens], dim=-1)
@@ -707,6 +743,7 @@ class LlamaLM(nn.Module):
                 )  # (b, s, vocab_size)
 
             next_token_logits = logits[:, -1]
+            step_logits.append(next_token_logits)
             next_token_id = self.generate_one_token(
                 next_token_logits,
                 temperature=temperature,
@@ -724,6 +761,9 @@ class LlamaLM(nn.Module):
             is_finished = is_finished | finished_at_this_step
             if is_finished.all():
                 break
+
+        if return_logits:
+            return generated_tokens, torch.stack(step_logits, dim=1)
 
         return generated_tokens
 
