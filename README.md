@@ -149,6 +149,140 @@ In static batching, correctness should be defined at the level of the **logical 
 
 For these inactive slots, we do not make a semantic guarantee about the tokens or logits produced. The only important requirement is that active sequences continue to behave correctly. Under this weaker semantic, a simple implementation that keeps advancing physical positions after EOS can still be acceptable. A stricter implementation may additionally freeze position ids and prevent inactive slots from being attended to, but that is an implementation choice rather than a required part of the semantic contract.
 
+## Continuous Batching
+
+### Problem
+
+A clear problem with static batching: during decode, sequences finish at different times. Finished sequences leave inactive slots while other sequences are still generating. We waste GPU compute and memory on inactive slots of already-finished sequences. 
+
+### Scheduling Techniques
+
+A mental model for scheduling techniques based on the unit of scheduling (batch vs. sequence vs. one step):
+
+* Batch-level scheduling: Form a batch and run the whole batch until all requests finish. The batch membership is fixed. 
+* Sequence-level scheduling: Once a sequence is admitted, it usually stays scheduled until it finishes.
+* Iteration-level scheduling: At each decode iteration, decide which sequences participate in the next forward pass.
+
+Static batching is batch-level scheduling because once a batch is formed, its membership remains fixed until the batch completes.
+
+### Continuous batching
+
+**Continuous batching** addresses the problem in static batching by dynamically changing the batch membership in the decode phase. When a sequence generates an \<eos>, it's immediately removed from the batch and replaced by another sequence. This eliminates inactive slots and improves GPU throughput. 
+
+Example:
+
+```
+Step t:     A B C D
+            B finishes
+Step t+1:   A E C D
+            D finishes
+Step t+2:   A E C F
+```
+
+Continuous batching removes wasted batch slots. It does not require waiting for the longest sequence in the original batch.
+
+Continuous batching is iteration-level scheduling because the scheduler can update the active decode batch after every decode iteration. In the common case, unfinished sequences continue decoding; finished sequences are removed; newly ready sequences are admitted. More advanced schedulers may also pause or preempt unfinished sequences for memory, fairness, or priority reasons.
+
+### Request Lifecycle
+
+For each request, it can be in one of four states:
+
+* pending_prefill: request has arrived but hasn't been prefilled yet. 
+* pending_decode: Prefill complete and KV cache exists. Eligible to be decoded.
+* active_decode: request has been admitted into the active decode set and is currently participating in decode iterations.  
+* finished: Request is complete. KV cache can be freed. 
+
+A natural question is: why do we need a separate `pending_decode` state? Why cannot a request move from `pending_prefill` directly into `active_decode`? 
+
+Instead of moving from `pending_prefill` to `active_decode` directly, a separate `pending_decode` state is useful because finishing prefill only makes a request eligible for decode. It does not mean the request should immediately enter the active decode set. The scheduler may delay admission for reasons like fairness/priority policy, preference to optimize inter-token latency for already-active requests, etc.
+
+### Inference Server Flow
+
+If we go one level higher above and consider what an inference server is doing, it's conceptually running in a loop:
+
+```python
+pending_prefill = { ... }
+pending_decode = { ... }
+active_decode = { ... }
+finished = { ... }
+
+while True:
+    receive_new_requests(pending_prefill)
+    
+	if should_prefill(pending_prefill, pending_decode, active_decode, ...):
+        # prefill
+        prefill_batch = get_prefill_batch(pending_prefill)
+        next_tokens = model.prefill(prefill_batch)
+        update_sequences(next_tokens)
+        move_to_pending_decode(prefill_batch, ready_to_decode)
+    else:
+        # decode
+        admit_ready_requests(pending_decode, active_decode)
+        next_tokens = model.decode(active_decode)
+        update_sequences(next_tokens)
+        remove_finished_requests(active_decode, finished)
+```
+
+At each scheduling step, the server decides whether to run a prefill step, a decode step, or a mix. Mixing prefill and decode requires more sophisticated scheduling and kernels, and ragged representations can help execute such variable-shaped work efficiently (see "Ragged Batching" section below).
+
+Prefill has better arithmetic intensity because it processes sequence positions in parallel, resulting in higher GPU utilization. It directly affects time-to-first-token (TTFT).  Decode has lower arithmetic and is often more memory intensive due to KV-cache access. It directly affects inter-token latency. 
+
+Whether to prioritize prefill or decode is a tradeoff: TTFT vs. inter-token latency, GPU utilization, etc. 
+
+### KV Cache
+
+For static batching, we can manage the KV cache for all sequences in a batch together. For continuous batching, we need to be able to manage the KV cache for each sequence independently. 
+
+### Dense vs. Ragged batching
+
+Continuous batching is a scheduling strategy for determining the decode batch. 
+
+Ragged batch is an execution technique for processing variable-length sequences without padding everything to the length of the longest sequence. 
+
+Let's consider how continuous batching can be implemented. One way is to represent the batch similarly to static batching, `(batch, seq_len, ...)`. For prefill, clearly we need to pad the prompts to the same length. For decode, each active sequence contributes one new query token so the input is already the same shape `(batch, 1, hidden_dim)`. However, padding is still needed for the attention operation. 
+
+For example:
+
+```
+A current length = 128
+B current length = 2048
+C current length = 512
+```
+
+The real work is:
+
+```
+A attends over 128 KV positions
+B attends over 2048 KV positions
+C attends over 512 KV positions
+```
+
+A dense implementation may instead treat every sequence as if it had length `2048`, masking out padded positions for the shorter sequences. This wastes attention work and KV-cache memory bandwidth.
+
+Ragged batching avoids representing the batch as a fully rectangular tensor of shape `(batch, max_seq_len, ...)`. Instead, it packs real tokens or KV blocks together and tracks metadata such as sequence lengths, offsets, block tables, attention masks, and position IDs.. Read detailed explanation in Hugging Face's article: [Continuous Batching](https://huggingface.co/blog/continuous_batching).  
+
+### Summary
+
+Continuous batching should be understood as a scheduling technique. It updates the active decode set after each decode iteration: finished requests are removed immediately, and decode-ready requests are admitted into freed capacity.
+
+At the server-flow level, requests move through a lifecycle:
+
+```
+pending_prefill -> pending_decode -> active_decode -> finished
+```
+
+The scheduler balances prefill and decode work. Prefill affects time-to-first-token and tends to have higher arithmetic intensity. Decode affects inter-token latency and is often constrained by KV-cache memory bandwidth.
+
+At the implementation level, continuous batching requires flexible per-sequence state management. KV cache can no longer be tied permanently to fixed batch slots. Systems often use sequence-oriented or paged KV cache, plus ragged/paged attention, to execute variable-length decode batches efficiently.
+
+A layered view:
+
+- Top level: request lifecycle and inference server loop.
+- Middle level: scheduling strategy, such as static batching vs. continuous batching.
+- Bottom level: execution and memory mechanisms, such as KV cache management, ragged batching, and paged KV cache and paged attention (later milestones).
+
+
+
 ## Directory Structure
 - `tests/`: testcases. Runnable throughout the project.
 - `debug/`: debug scripts when working on milestones. Expected to be runnable at the commit it's created or updated, but later commits might break it.
