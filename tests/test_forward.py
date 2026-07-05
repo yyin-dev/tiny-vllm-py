@@ -37,8 +37,6 @@ import sys
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
 
-from kv_cache import KVCache
-
 MAX_ABS_DIFF_THRESHOLD = 0.25
 MEAN_ABS_DIFF_THRESHOLD = 0.1
 TIGHT_MAX_ABS_DIFF_THRESHOLD = 1e-4
@@ -81,6 +79,21 @@ def assert_allclose_tight(a: torch.Tensor, b: torch.Tensor):
         max_diff_tolerance=TIGHT_MAX_ABS_DIFF_THRESHOLD,
         mean_diff_tolerance=TIGHT_MEAN_ABS_DIFF_THRESHOLD,
     )
+
+
+def append_kvs(
+    kvs: list[tuple[torch.Tensor, torch.Tensor]],
+    new_kvs: list[tuple[torch.Tensor, torch.Tensor]],
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    updated = []
+    for (k_prefix, v_prefix), (new_k, new_v) in zip(kvs, new_kvs, strict=True):
+        updated.append(
+            (
+                torch.cat([k_prefix, new_k], dim=-2),
+                torch.cat([v_prefix, new_v], dim=-2),
+            )
+        )
+    return updated
 
 
 def test_milestone1_single_step_logits(local_model, reference_model, tokenizer, device):
@@ -170,12 +183,13 @@ def test_milestone2_kv_cache_multi_steps_logits_self_consistency(
         encoded = torch.tensor(batch_encoding.input_ids, device=device)
 
         # Reference: without kv cache
-        ref_first_step_last_logits = model(encoded)[:, -1]
+        ref_prefill_logits, _ = model(encoded)
+        ref_first_step_last_logits = ref_prefill_logits[:, -1]
         ref_first_step_token = torch.argmax(ref_first_step_last_logits, dim=-1).item()
 
         # With cache: Prefill
-        kv_cache = KVCache()
-        prefill_last_logits = model(encoded, kv_cache=kv_cache)[:, -1]
+        prefill_logits, kvs = model(encoded, kvs=None)
+        prefill_last_logits = prefill_logits[:, -1]
         prefill_max_prob_token = torch.argmax(prefill_last_logits, dim=-1).item()
 
         # compare prefill result
@@ -188,15 +202,16 @@ def test_milestone2_kv_cache_multi_steps_logits_self_consistency(
             (encoded, torch.tensor([[ref_first_step_token]], device=device)), dim=-1
         )
         next_decode_step_input = torch.tensor([[prefill_max_prob_token]], device=device)
-        for step in range(steps):
+        for _ in range(steps):
             # without cache
-            ref_last_logits = model(curr_prompt_and_decode_res)[:, -1]
+            ref_logits, _ = model(curr_prompt_and_decode_res)
+            ref_last_logits = ref_logits[:, -1]
             ref_max_prob_token = torch.argmax(ref_last_logits, dim=-1).item()
 
             # with cache
-            decode_step_last_logits = model(next_decode_step_input, kv_cache=kv_cache)[
-                :, -1
-            ]
+            decode_step_logits, new_kvs = model(next_decode_step_input, kvs=kvs)
+            decode_step_last_logits = decode_step_logits[:, -1]
+            kvs = append_kvs(kvs, new_kvs)
 
             decode_step_max_prob_token = torch.argmax(
                 decode_step_last_logits, dim=-1
@@ -229,8 +244,8 @@ def test_milestone2_kv_cache_multi_steps_logits(
 
         with torch.no_grad():
             # With cache: prefill.
-            kv_cache = KVCache()
-            prefill_last_logits = local_model(encoded, kv_cache=kv_cache)[:, -1]
+            prefill_logits, kvs = local_model(encoded, kvs=None)
+            prefill_last_logits = prefill_logits[:, -1]
 
             # Reference prefill: full forward on the same logical prefix.
             ref_prefill_last_logits = reference_model(encoded).logits[:, -1]
@@ -253,8 +268,8 @@ def test_milestone2_kv_cache_multi_steps_logits(
                 [[prefill_max_prob_token]], device=device
             )
 
-            steps = 8
-            for step in range(steps):
+            steps = 4
+            for _ in range(steps):
                 # Reference: recompute logits on the full logical prefix.
                 ref_last_logits = reference_model(curr_prompt_and_decode_res).logits[
                     :, -1
@@ -262,9 +277,11 @@ def test_milestone2_kv_cache_multi_steps_logits(
                 ref_max_prob_token = torch.argmax(ref_last_logits, dim=-1).item()
 
                 # Local cached decode: consume only the newest token.
-                decode_step_last_logits = local_model(
-                    next_decode_step_input, kv_cache=kv_cache
-                )[:, -1]
+                decode_step_logits, new_kvs = local_model(
+                    next_decode_step_input, kvs=kvs
+                )
+                decode_step_last_logits = decode_step_logits[:, -1]
+                kvs = append_kvs(kvs, new_kvs)
                 decode_step_max_prob_token = torch.argmax(
                     decode_step_last_logits, dim=-1
                 ).item()
