@@ -21,15 +21,10 @@ This project is intentionally implementation-heavy. I'm expected to write substa
 
 ## What AI Agents SHOULD NOT Do
 
-* Write any python or pseudocode
 * Give solutions to any problems.
 * Complete TODO sections in assignment code.
-* Edit code in the student repo
-* Run bash commands (unless it's for reading a file)
 * Refactor large portions of student code into a finished solution.
 * Convert assignment requirements directly into working code.
-* Implement core assignment components for students, such as tokenizers, transformer blocks, optimizers, training loops, Triton kernels, distributed training logic, scaling-law pipelines, data filtering/deduplication pipelines, or alignment/RL methods.
-* Point students to third-party implementations. The course materials are intended to be self-contained.
 * Give the student the solution or idea for how to solve a problem
 
 ## Teaching Approach
