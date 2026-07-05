@@ -186,19 +186,20 @@ class CausalMultiHeadSelfAttention(nn.Module):
     def forward(
         self,
         x: Float[Tensor, " ... seq d_k"],
-        kv_cache: KVCache | None = None,
+        kvs: tuple[torch.Tensor, torch.Tensor] | None = None,
         debug_collector: DebugCollector | None = None,
         attn_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-    ) -> Float[Tensor, " ... seq d_v"]:
+    ) -> tuple[Float[Tensor, " ... seq d_v"], torch.Tensor, torch.Tensor]:
         """
         Args:
             x: The input to perform multi-headed self-attention on.
+            kvs: (..., num_heads, seq_len, head_dim)
             positional_ids: The positional indices along the sequence dimension of the input embeddings.
             attn_mask: If passed in, use it as is for [scaled_dot_product_attention]
 
         Returns:
-            Self-attention outputs.
+            Self-attention outputs, new_k, new_v
         """
         *batch_dims, sequence_length, d_model = x.size()
         assert d_model == self.d_model
@@ -209,17 +210,18 @@ class CausalMultiHeadSelfAttention(nn.Module):
         if debug_collector:
             debug_collector.record(self.layer_idx, "q_pre_rope", Q)
 
-        if kv_cache is None or kv_cache.is_empty(self.layer_idx):
-            # without cache or prefill
-            K = self.k_proj(x)
-            V = self.v_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
 
-            K = rearrange(
-                K, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
-            )
-            V = rearrange(
-                V, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
-            )
+        K = rearrange(
+            K, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
+        )
+        V = rearrange(
+            V, "... seq (heads d) -> ... heads seq d", heads=self.num_kv_heads
+        )
+
+        if kvs is None:
+            # without cache or prefill
             if debug_collector:
                 debug_collector.record(self.layer_idx, "k_pre_rope", K)
                 debug_collector.record(self.layer_idx, "v_for_attn", V)
@@ -231,48 +233,25 @@ class CausalMultiHeadSelfAttention(nn.Module):
                     debug_collector.record(self.layer_idx, "q_post_rope", Q)
                     debug_collector.record(self.layer_idx, "k_post_rope", K)
 
-            if kv_cache:
-                kv_cache.append_kvs(self.layer_idx, K, V)
-
-            # [torch.nn.functional.scaled_dot_product_attention] takes either
-            # [is_causal=True] or [attn_mask], but not both.
-            if attn_mask is not None:
-                # Assumes that attn_mask already incorporates causal-ness.
-                attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    query=Q, key=K, value=V, enable_gqa=True, attn_mask=attn_mask
-                )
-            else:
-                # No attn_mask is passed in, use causal
-                attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    query=Q, key=K, value=V, enable_gqa=True, is_causal=True
-                )
+            is_causal = True
+            new_k, new_v = K, V
         else:
             # decode
             # Q: (b num_heads 1 head_dim)
             assert sequence_length == 1
 
-            current_token_k = self.k_proj(x)  # b 1 (h d)
-            current_token_v = self.v_proj(x)  # b 1 (h d)
+            current_token_k, current_token_v = K, V
 
-            current_token_k = rearrange(
-                current_token_k,
-                "... seq (heads d) -> ... heads seq d",
-                heads=self.num_kv_heads,
-            )
-            current_token_v = rearrange(
-                current_token_v,
-                "... seq (heads d) -> ... heads seq d",
-                heads=self.num_kv_heads,
-            )
             if debug_collector:
                 debug_collector.record(self.layer_idx, "k_pre_rope", current_token_k)
                 debug_collector.record(self.layer_idx, "v_current", current_token_v)
 
+            k_prefix, v_prefix = kvs
+
             # get token position from kv-cache length
             if position_ids is None:
-                position_ids = torch.tensor(
-                    [[kv_cache.current_length(self.layer_idx)]], device=Q.device
-                )
+                current_len = k_prefix.shape[-2]
+                position_ids = torch.tensor([[current_len]], device=Q.device)
 
             if debug_collector:
                 debug_collector.record(self.layer_idx, "token_positions", position_ids)
@@ -286,7 +265,6 @@ class CausalMultiHeadSelfAttention(nn.Module):
                         self.layer_idx, "k_post_rope", current_token_k
                     )
 
-            k_prefix, v_prefix = kv_cache.get_kv_prefix(self.layer_idx)
             if debug_collector:
                 debug_collector.record(self.layer_idx, "k_prefix", k_prefix)
                 debug_collector.record(self.layer_idx, "v_prefix", v_prefix)
@@ -297,24 +275,26 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 debug_collector.record(self.layer_idx, "k_for_attn", K)
                 debug_collector.record(self.layer_idx, "v_for_attn", V)
 
-            kv_cache.append_kvs(self.layer_idx, current_token_k, current_token_v)
+            is_causal = False
+            new_k, new_v = current_token_k, current_token_v
 
-            if attn_mask is not None:
-                attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    query=Q,
-                    key=K,
-                    value=V,
-                    attn_mask=attn_mask,
-                    enable_gqa=True,
-                )
-            else:
-                attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    query=Q,
-                    key=K,
-                    value=V,
-                    is_causal=False,
-                    enable_gqa=True,
-                )
+        if attn_mask is not None:
+            # Assumes that attn_mask already incorporates causal-ness.
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=Q,
+                key=K,
+                value=V,
+                attn_mask=attn_mask,
+                enable_gqa=True,
+            )
+        else:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=Q,
+                key=K,
+                value=V,
+                is_causal=is_causal,
+                enable_gqa=True,
+            )
 
         if debug_collector:
             debug_collector.record(self.layer_idx, "attn_output_heads", attn_output)
@@ -327,7 +307,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         # Apply the output projection
         output = self.output_proj(attn_output)
-        return output
+        return output, new_k, new_v
 
 
 class TransformerBlock(nn.Module):
@@ -375,11 +355,11 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        kv_cache: KVCache | None = None,
+        kvs: tuple[torch.Tensor, torch.Tensor] | None = None,
         debug_collector: DebugCollector | None = None,
         attn_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: FloatTensor of shape `(batch_size, sequence_length, d_model)`.
@@ -392,9 +372,9 @@ class TransformerBlock(nn.Module):
         # description in the paper.
 
         # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(
+        x_attn, new_k, new_v = self.attn(
             self.ln1(x),
-            kv_cache=kv_cache,
+            kvs=kvs,
             debug_collector=debug_collector,
             attn_mask=attn_mask,
             position_ids=position_ids,
@@ -404,7 +384,7 @@ class TransformerBlock(nn.Module):
         # Apply the feed-forward sublayer
         x_ffn = self.ffn(self.ln2(attn_sublayer_output))
         ffn_sublayer_output = attn_sublayer_output + x_ffn
-        return ffn_sublayer_output
+        return ffn_sublayer_output, new_k, new_v
 
 
 class LlamaLM(nn.Module):
@@ -498,11 +478,14 @@ class LlamaLM(nn.Module):
     def forward(
         self,
         x: Int[Tensor, " ... sequence_length"],
-        kv_cache: KVCache | None = None,
+        kvs: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         debug_collector: DebugCollector | None = None,
         attn_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-    ) -> Float[Tensor, " ... sequence_length vocab_size"]:
+    ) -> tuple[
+        Float[Tensor, " ... sequence_length vocab_size"],
+        list[tuple[torch.Tensor, torch.Tensor]],
+    ]:
         """
         Args:
             x: Input IDs for language modeling.
@@ -518,22 +501,29 @@ class LlamaLM(nn.Module):
 
         # (batch size, sequence_length, d_model)
         x = embedded_tokens
+        new_kvs = []
 
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
+            layer_kvs = None
+            if kvs is not None:
+                layer_kvs = kvs[idx]
+
             # (batch size, sequence_length, d_model)
-            x = layer(
+            x, new_k, new_v = layer.forward(
                 x,
-                kv_cache=kv_cache,
+                kvs=layer_kvs,
                 debug_collector=debug_collector,
                 attn_mask=attn_mask,
                 position_ids=position_ids,
             )
 
+            new_kvs.append((new_k, new_v))
+
         # (batch size, sequence_length, d_model)
         x = self.ln_final(x)
         # (batch size, sequence_length, vocab_size)
         logits = self.lm_head(x)
-        return logits
+        return (logits, new_kvs)
 
     def generate_one_token(
         self,
@@ -650,7 +640,6 @@ class LlamaLM(nn.Module):
         eos_token_id: int | None = None,
         do_sample: bool = False,
         use_kv_cache: bool = False,
-        kv_cache: KVCache | None = None,
         debug_collector: DebugCollector | None = None,
         return_logits: bool = False,
     ):
@@ -693,9 +682,6 @@ class LlamaLM(nn.Module):
         batch_size = x.shape[0]
         prompt_len = x.shape[-1]
 
-        if use_kv_cache and kv_cache is None:
-            kv_cache = KVCache()
-
         print("Prefilling/Step 0 starts")
 
         # loop state
@@ -717,13 +703,22 @@ class LlamaLM(nn.Module):
             query_physical_idx_end=prompt_len,
         )
 
-        prefill_logits = self.forward(
+        prefill_logits, new_kvs = self.forward(
             x,
-            kv_cache=kv_cache,
+            kvs=None,
             debug_collector=debug_collector,
             attn_mask=attn_mask,
             position_ids=position_ids,
         )
+
+        if use_kv_cache:
+            kv_cache = KVCache()
+            for i in range(len(self.layers)):
+                new_k, new_v = new_kvs[i]
+                kv_cache.append_kvs(i, new_k, new_v)
+        else:
+            kv_cache = None
+
         next_token_logits = prefill_logits[:, -1]
         step_logits = [next_token_logits]
         next_token_id = self.generate_one_token(
@@ -756,13 +751,17 @@ class LlamaLM(nn.Module):
                     query_physical_idx_end=seq_len,
                 )
 
-                logits = self.forward(
+                logits, new_kvs = self.forward(
                     prev_token,
-                    kv_cache=kv_cache,
+                    kvs=[kv_cache.get_kv_prefix(i) for i in range(len(self.layers))],
                     attn_mask=attn_mask,
                     position_ids=position_ids,
                     debug_collector=debug_collector,
                 )
+
+                for i in range(len(self.layers)):
+                    new_k, new_v = new_kvs[i]
+                    kv_cache.append_kvs(i, new_k, new_v)
             else:
                 full_prefix = torch.cat([x, generated_tokens], dim=-1)
 
@@ -784,7 +783,7 @@ class LlamaLM(nn.Module):
                     ]
                     position_ids = position_ids[:, -self.context_length :]
 
-                logits = self.forward(
+                logits, _new_kvs = self.forward(
                     full_prefix,
                     attn_mask=attn_mask,
                     position_ids=position_ids,

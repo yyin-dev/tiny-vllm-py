@@ -18,6 +18,12 @@ Implement continuous batching with a higher-level `Engine` above `model.generate
   - Exposes separate `prefill(...)` and `decode(...)` APIs.
   - Does not know about engine request wrapper types.
 
+## Model Execution Boundary
+
+- `LlamaLM.forward` and internal modules in `model.py` operate on a normalized dense execution view.
+- They are batch-agnostic with respect to static batching vs. continuous batching.
+- `generate`, `prefill`, and `decode` are wrappers around `forward` and handle batching-mode-specific cache orchestration.
+
 ## Request Representations
 
 - User-facing request
@@ -78,9 +84,9 @@ Implement continuous batching with a higher-level `Engine` above `model.generate
 
 - Prefer decode by default.
 - Run prefill only when:
-  - `num_pending_prefill` exceeds a threshold, or
-  - oldest prefill wait time exceeds a threshold.
+  - `num_pending_prefill` exceeds a threshold.
 - If no decode-ready requests exist and prefill work exists, run prefill.
+- Time-based aging can be added later if needed.
 
 ## Batch Selection Policy: First Version
 
@@ -91,20 +97,23 @@ Implement continuous batching with a higher-level `Engine` above `model.generate
 
 ## Model-Facing API
 
-- `prefill(prompts, kv_states) -> first_tokens`
-  - Engine passes batched prompts and engine-owned empty KV state/handles.
-  - Model initializes KV state in place.
-  - Returns one token per prompt.
+- `generate`, `prefill`, and `decode` prepare dense execution inputs and call `forward()`.
+- `forward()` takes dense prior K/V state for the current execution and returns newly produced K/V slices.
+- `generate`, `prefill`, and `decode` are responsible for persistent cache writes, e.g. `append_kvs(...)`.
+- This keeps the shared model path agnostic to whether persistent KV state is stored batch-wise or per sequence.
 
-- `decode(input_tokens, kv_states) -> next_tokens`
-  - Engine passes one decode token per active request plus engine-owned KV state/handles.
-  - Model updates KV state in place.
-  - Returns one token per request.
+## KV Design
+
+- For this milestone, use dense layout and defer ragged batching.
+- Persistent KV state is managed per sequence/request outside the shared `forward()` path.
+- The shared model execution path should not depend on per-request cache objects.
+- Raw dense K/V tensors are preferred at the `forward()` boundary because they preserve a single batch-agnostic execution path.
+- Tradeoff: wrappers (`generate`, `prefill`, `decode`) do more explicit cache orchestration and writeback.
 
 ## Ownership Boundary
 
 - Engine owns request lifecycle and KV state association.
-- Model only consumes batched tensors / KV handles needed for execution.
+- Shared model execution only consumes normalized dense inputs needed for execution.
 - Model should not depend on engine-specific types like prefill work item or decode-ready state.
 
 ## Decode-Ready State Essentials
