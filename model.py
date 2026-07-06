@@ -8,7 +8,8 @@ import logging
 from jaxtyping import Float, Int, Bool
 import os
 import json
-from kv_cache import KVCache
+from kv_cache import KVCache, RequestKVCache
+from engine_model import EngineModel
 from debug_collector import DebugCollector
 
 logger = logging.getLogger(__name__)
@@ -387,7 +388,7 @@ class TransformerBlock(nn.Module):
         return ffn_sublayer_output, new_k, new_v
 
 
-class LlamaLM(nn.Module):
+class LlamaLM(nn.Module, EngineModel):
     """A Transformer language model.
 
     Args:
@@ -816,6 +817,18 @@ class LlamaLM(nn.Module):
             return generated_tokens, torch.stack(step_logits, dim=1)
 
         return generated_tokens
+
+    @torch.no_grad()
+    def prefill(
+        self, prompts_and_kvs: list[tuple[torch.Tensor, RequestKVCache]]
+    ) -> list[torch.Tensor]:
+        raise NotImplementedError()
+
+    @torch.no_grad()
+    def decode(
+        self, prev_tokens_and_kvs: list[tuple[torch.Tensor, RequestKVCache]]
+    ) -> list[torch.Tensor]:
+        raise NotImplementedError()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path: str):

@@ -4,6 +4,10 @@ from jaxtyping import Float
 
 
 class LayerKVCache:
+    """
+    Data for all sequences are stored together in a single rectangular tensor.
+    """
+
     def __init__(self):
         self.ks = torch.tensor([])
         self.vs = torch.tensor([])
@@ -71,7 +75,15 @@ class KVCache:
         return self.layers[layer_idx].current_length()
 
     def is_empty(self, layer_idx) -> bool:
-        if layer_idx not in self.layers:
-            self.layers[layer_idx] = LayerKVCache()
+        return self.current_length(layer_idx=layer_idx) == 0
 
-        return self.layers[layer_idx].is_empty()
+
+class RequestKVCache(KVCache):
+    """
+    KV cache owned by a single resumable request.
+
+    This currently reuses the same implementation as KVCache and exists to make
+    the ownership boundary explicit in continuous batching code.
+    """
+
+    pass
