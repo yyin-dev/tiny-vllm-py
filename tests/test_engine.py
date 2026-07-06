@@ -111,7 +111,8 @@ def test_next_step_op_no_op_when_no_requests():
 
 def test_next_step_op_prefers_decode_below_threshold():
     engine = make_engine(FakeEngineModel(), prefill_threshold=3)
-    engine.pending_prefill = [Request(1, "a"), Request(2, "bb")]
+    engine.add_request(Request(1, "a"))
+    engine.add_request(Request(2, "bb"))
     engine.pending_decode = [
         DecodeReadyRequest(Request(3, "ccc"), RequestKVCache(), torch.tensor([[7]]))
     ]
@@ -121,7 +122,8 @@ def test_next_step_op_prefers_decode_below_threshold():
 
 def test_next_step_op_prefill_when_threshold_reached():
     engine = make_engine(FakeEngineModel(), prefill_threshold=2)
-    engine.pending_prefill = [Request(1, "a"), Request(2, "bb")]
+    engine.add_request(Request(1, "a"))
+    engine.add_request(Request(2, "bb"))
     engine.pending_decode = [
         DecodeReadyRequest(Request(3, "ccc"), RequestKVCache(), torch.tensor([[7]]))
     ]
@@ -132,14 +134,14 @@ def test_next_step_op_prefill_when_threshold_reached():
 def test_step_prefill_moves_non_eos_request_to_pending_decode():
     model = FakeEngineModel(prefill_outputs=[[6]])
     engine = make_engine(model, prefill_threshold=1, prefill_batch_size=1)
-    engine.pending_prefill = [Request(1, "hello")]
+    engine.add_request(Request(1, "hello"))
 
     result = engine.step()
 
     assert result == {1: "tok_6"}
     assert len(engine.pending_prefill) == 0
     assert len(engine.pending_decode) == 1
-    assert len(engine.finished) == 0
+    assert engine.collect_finished_requests() == []
 
     decode_ready = engine.pending_decode[0]
     assert decode_ready.id == 1
@@ -153,14 +155,14 @@ def test_step_prefill_moves_non_eos_request_to_pending_decode():
 def test_step_prefill_moves_eos_request_to_finished():
     model = FakeEngineModel(prefill_outputs=[[0]])
     engine = make_engine(model, prefill_threshold=1, prefill_batch_size=1)
-    engine.pending_prefill = [Request(1, "hello")]
+    engine.add_request(Request(1, "hello"))
 
     result = engine.step()
 
     assert result == {1: "tok_0"}
     assert len(engine.pending_decode) == 0
-    assert len(engine.finished) == 1
-    assert engine.finished[0].id == 1
+    assert engine.collect_finished_requests() == [1]
+    assert engine.collect_finished_requests() == []
 
 
 def test_step_decode_requeues_unfinished_requests_at_front():
@@ -175,7 +177,7 @@ def test_step_decode_requeues_unfinished_requests_at_front():
     result = engine.step()
 
     assert result == {1: "tok_8", 2: "tok_9"}
-    assert len(engine.finished) == 0
+    assert engine.collect_finished_requests() == []
     assert [request.id for request in engine.pending_decode] == [1, 2, 3]
     assert torch.equal(
         engine.pending_decode[0].generated_tokens, torch.tensor([[5, 8]])
@@ -203,8 +205,62 @@ def test_step_decode_moves_eos_request_to_finished():
     result = engine.step()
 
     assert result == {1: "tok_0", 2: "tok_9"}
-    assert [request.id for request in engine.finished] == [1]
+    assert engine.collect_finished_requests() == [1]
+    assert engine.collect_finished_requests() == []
     assert [request.id for request in engine.pending_decode] == [2, 3]
     assert torch.equal(
         engine.pending_decode[0].generated_tokens, torch.tensor([[6, 9]])
     )
+
+
+def test_engine_single_request_lifecycle_with_finished_collection():
+    model = FakeEngineModel(prefill_outputs=[[5]], decode_outputs=[[0]])
+    engine = make_engine(model, prefill_threshold=1, prefill_batch_size=1)
+    request = Request(1, "hello")
+
+    engine.add_request(request)
+
+    first_step = engine.step()
+    assert first_step == {1: "tok_5"}
+    assert engine.collect_finished_requests() == []
+
+    second_step = engine.step()
+    assert second_step == {1: "tok_0"}
+    assert engine.collect_finished_requests() == [1]
+    assert engine.collect_finished_requests() == []
+    assert engine.next_step_op() == Op.No_op
+
+
+def test_engine_new_request_can_arrive_while_another_is_decoding():
+    model = FakeEngineModel(
+        prefill_outputs=[[5], [8]],
+        decode_outputs=[[6, 9], [0, 0]],
+    )
+    engine = make_engine(
+        model,
+        prefill_threshold=1,
+        prefill_batch_size=1,
+        decode_batch_size=2,
+    )
+
+    engine.add_request(Request(1, "hello"))
+
+    step1 = engine.step()
+    assert step1 == {1: "tok_5"}
+    assert [req.id for req in engine.pending_decode] == [1]
+
+    engine.add_request(Request(2, "world"))
+
+    step2 = engine.step()
+    assert step2 == {2: "tok_8"}
+    assert [req.id for req in engine.pending_decode] == [1, 2]
+    assert engine.pending_prefill == []
+
+    step3 = engine.step()
+    assert step3 == {1: "tok_6", 2: "tok_9"}
+    assert [req.id for req in engine.pending_decode] == [1, 2]
+
+    step4 = engine.step()
+    assert step4 == {1: "tok_0", 2: "tok_0"}
+    assert engine.collect_finished_requests() == [1, 2]
+    assert engine.pending_decode == []
