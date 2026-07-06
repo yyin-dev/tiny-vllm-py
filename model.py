@@ -491,9 +491,15 @@ class LlamaLM(nn.Module, EngineModel):
         Args:
             x: Input IDs for language modeling.
 
-        Returns: A FloatTensor of shape
+        Returns: A tuple containing model forward pass output, and a list containing
+            new KVs for each layer.
+
+            The forward pass output is a FloatTensor of shape
             (batch size, sequence_length, vocab_size) with the predicted unnormalized next-word
             distribution for each token.
+
+            The new KVs is a list of (tensor, tensor). The shape of each tensor
+            is (b, num_heads, seq, head_dim).
         """
         # (batch size, sequence_length, d_model)
         # NOTE: paper mentions "In the embedding layers, we multiply those
@@ -822,7 +828,76 @@ class LlamaLM(nn.Module, EngineModel):
     def prefill(
         self, prompts_and_kvs: list[tuple[torch.Tensor, RequestKVCache]]
     ) -> list[torch.Tensor]:
-        raise NotImplementedError()
+        """
+        When generating the token, temperature=1.0, top_k=None, do_sample=False
+
+        """
+        for prompt, cache in prompts_and_kvs:
+            assert len(prompt.shape) == 2
+            assert prompt.shape[0] == 1
+            assert prompt.shape[1] > 0
+            assert cache.is_empty(0)
+
+        device = prompts_and_kvs[0][0].device
+
+        # Convert per-request layout into dense layout
+        batch_size = len(prompts_and_kvs)
+        inputs = torch.nn.utils.rnn.pad_sequence(
+            sequences=[
+                rearrange(prompt, "1 seq -> seq")
+                for (prompt, _cache) in prompts_and_kvs
+            ],
+            batch_first=True,
+            # Using 0 is safe here because padded positions are fully masked out,
+            # and logical lengths come from the original prompt shapes.
+            padding_value=0,
+            padding_side="left",
+        )
+
+        physical_length = inputs.shape[-1]
+        logical_length = torch.tensor(
+            [[p.shape[-1]] for (p, _) in prompts_and_kvs], device=device
+        )
+        num_padding_tokens = physical_length - logical_length  # (b, 1)
+
+        attn_mask, position_ids = self.attn_mask_and_position_ids(
+            num_padding_tokens=num_padding_tokens,
+            logical_length=logical_length,
+            physical_length=physical_length,
+            query_physical_idx_start=0,
+            query_physical_idx_end=physical_length,
+        )
+
+        # new_kvs: (b, num_heads, seq_len, head_dim)
+        prefill_logits, new_kvs = self.forward(
+            inputs,
+            kvs=None,
+            attn_mask=attn_mask,
+            position_ids=position_ids,
+        )
+
+        # Convert dense layout in per-request layout
+        for layer_idx, (ks_for_all_requests, vs_for_all_requests) in enumerate(new_kvs):
+            for req_idx in range(batch_size):
+                k_for_this_req = ks_for_all_requests[req_idx, :]
+                k_for_this_req = rearrange(k_for_this_req, "h seq d -> 1 h seq d")
+                v_for_this_req = vs_for_all_requests[req_idx, :]
+                v_for_this_req = rearrange(v_for_this_req, "h seq d -> 1 h seq d")
+
+                # Strip kv for paddings
+                logical_seq_start = int(num_padding_tokens[req_idx].item())
+                k_for_this_req = k_for_this_req[:, :, logical_seq_start:]
+                v_for_this_req = v_for_this_req[:, :, logical_seq_start:]
+
+                _, cache = prompts_and_kvs[req_idx]
+                cache.append_kvs(layer_idx, ks=k_for_this_req, vs=v_for_this_req)
+
+        prefill_token = self.generate_one_token(
+            prefill_logits[:, -1], temperature=1.0, top_k=None, do_sample=False
+        )  # (b, 1)
+
+        # Reformat into a list of (1, 1) tensors
+        return [rearrange(row, "1 -> 1 1") for row in prefill_token]
 
     @torch.no_grad()
     def decode(
