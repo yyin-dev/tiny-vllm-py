@@ -876,12 +876,12 @@ class LlamaLM(nn.Module, EngineModel):
             position_ids=position_ids,
         )
 
-        # Convert dense layout in per-request layout
-        for layer_idx, (ks_for_all_requests, vs_for_all_requests) in enumerate(new_kvs):
+        # Convert dense layout to per-request layout
+        for layer_idx, (k_for_all_reqs, v_for_all_reqs) in enumerate(new_kvs):
             for req_idx in range(batch_size):
-                k_for_this_req = ks_for_all_requests[req_idx, :]
+                k_for_this_req = k_for_all_reqs[req_idx, :]
                 k_for_this_req = rearrange(k_for_this_req, "h seq d -> 1 h seq d")
-                v_for_this_req = vs_for_all_requests[req_idx, :]
+                v_for_this_req = v_for_all_reqs[req_idx, :]
                 v_for_this_req = rearrange(v_for_this_req, "h seq d -> 1 h seq d")
 
                 # Strip kv for paddings
@@ -903,7 +903,88 @@ class LlamaLM(nn.Module, EngineModel):
     def decode(
         self, prev_tokens_and_kvs: list[tuple[torch.Tensor, RequestKVCache]]
     ) -> list[torch.Tensor]:
-        raise NotImplementedError()
+        for prev_token, cache in prev_tokens_and_kvs:
+            assert prev_token.shape == (1, 1)
+
+            seq_len = cache.current_length(0)
+            for i in range(1, len(self.layers)):
+                assert seq_len == cache.current_length(i)
+
+        device = prev_tokens_and_kvs[0][0].device
+        prev_tokens = [token for (token, _) in prev_tokens_and_kvs]  # [(1,1)]
+        inputs = torch.cat(prev_tokens, dim=0)  # (b, 1)
+
+        # convert per-sequence kv into dense layout
+        # prev_token_and_kvs is per-request, then per-layer
+        # self.forward(kvs) expects kvs to be per-layer, then per-request
+        ks_per_layer: list[list[Tensor]] = [[] for _ in range(len(self.layers))]
+        vs_per_layer: list[list[Tensor]] = [[] for _ in range(len(self.layers))]
+        for _, req_cache in prev_tokens_and_kvs:
+            for layer_idx in range(len(self.layers)):
+                ks, vs = req_cache.get_kv_prefix(layer_idx)
+                ks_per_layer[layer_idx].append(ks)
+                vs_per_layer[layer_idx].append(vs)
+
+        def pad_request_kvs_of_one_layer(kv_state):
+            """
+            Pad a K sequence OR a V sequence to the same length.
+            """
+            kvs = [rearrange(kv, "1 h s d -> s h d") for kv in kv_state]
+            kvs_padded = torch.nn.utils.rnn.pad_sequence(
+                sequences=kvs,
+                batch_first=True,
+                padding_value=0,
+                padding_side="left",
+            )  # (b, s, h, d)
+            kvs_padded = rearrange(kvs_padded, "b s h d -> b h s d")
+            return kvs_padded
+
+        kvs_per_layer: list[tuple[Tensor, Tensor]] = []
+        for ks_this_layer, vs_this_layer in zip(ks_per_layer, vs_per_layer):
+            ks_this_layer_padded = pad_request_kvs_of_one_layer(ks_this_layer)
+            vs_this_layer_padded = pad_request_kvs_of_one_layer(vs_this_layer)
+            kvs_per_layer.append((ks_this_layer_padded, vs_this_layer_padded))
+
+        # Padding should be the same across layers. Here we use 0-th layer.
+        # The logical and physical length should include the current token as
+        # well, thus +1.
+        physical_length = kvs_per_layer[0][0].shape[-2] + 1
+        logical_length = torch.tensor(
+            [[k.shape[-2] + 1] for k in ks_per_layer[0]], device=device
+        )
+        num_padding_tokens = physical_length - logical_length
+
+        attn_mask, position_ids = self.attn_mask_and_position_ids(
+            num_padding_tokens=num_padding_tokens,
+            logical_length=logical_length,
+            physical_length=physical_length,
+            query_physical_idx_start=physical_length - 1,
+            query_physical_idx_end=physical_length,
+        )
+
+        logits, new_kvs = self.forward(
+            inputs, kvs=kvs_per_layer, attn_mask=attn_mask, position_ids=position_ids
+        )
+
+        # Convert dense layout to per-request laytout
+        batch_size = len(prev_tokens_and_kvs)
+        for layer_idx, (k_for_all_reqs, v_for_all_reqs) in enumerate(new_kvs):
+            for req_idx in range(batch_size):
+                k_for_this_req = k_for_all_reqs[req_idx, :]
+                k_for_this_req = rearrange(k_for_this_req, "h seq d -> 1 h seq d")
+                v_for_this_req = v_for_all_reqs[req_idx, :]
+                v_for_this_req = rearrange(v_for_this_req, "h seq d -> 1 h seq d")
+
+                # Strip kv for paddings
+                _, cache = prev_tokens_and_kvs[req_idx]
+                cache.append_kvs(layer_idx, ks=k_for_this_req, vs=v_for_this_req)
+
+        decode_token = self.generate_one_token(
+            logits[:, -1], temperature=1.0, top_k=None, do_sample=False
+        )
+
+        # Reformat into a list of (1, 1) tensors
+        return [rearrange(row, "1 -> 1 1") for row in decode_token]
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path: str):
