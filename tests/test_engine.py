@@ -59,6 +59,7 @@ class FakeEngineModel(EngineModel):
         prefill_outputs: list[list[int]] | None = None,
         decode_outputs: list[list[int]] | None = None,
     ):
+        self.device = torch.device("cpu")
         self.prefill_outputs = deque(prefill_outputs or [])
         self.decode_outputs = deque(decode_outputs or [])
 
