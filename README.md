@@ -185,12 +185,13 @@ Continuous batching is iteration-level scheduling because the scheduler can upda
 
 ### Request Lifecycle
 
-For each request, it can be in one of four states:
+For each request, it can be in one of three durable states:
 
 * pending_prefill: request has arrived but hasn't been prefilled yet. 
 * pending_decode: Prefill complete and KV cache exists. Eligible to be decoded.
-* active_decode: request has been admitted into the active decode set and is currently participating in decode iterations.  
 * finished: Request is complete. KV cache can be freed. 
+
+`active_decode` is **not** a separate durable lifecycle state. It is a transient scheduler view: the subset of requests in `pending_decode` selected for the current decode step.
 
 A natural question is: why do we need a separate `pending_decode` state? Why cannot a request move from `pending_prefill` directly into `active_decode`? 
 
@@ -203,13 +204,12 @@ If we go one level higher above and consider what an inference server is doing, 
 ```python
 pending_prefill = { ... }
 pending_decode = { ... }
-active_decode = { ... }
 finished = { ... }
 
 while True:
     receive_new_requests(pending_prefill)
     
-	if should_prefill(pending_prefill, pending_decode, active_decode, ...):
+	if should_prefill(pending_prefill, pending_decode, ...):
         # prefill
         prefill_batch = get_prefill_batch(pending_prefill)
         next_tokens = model.prefill(prefill_batch)
@@ -217,17 +217,45 @@ while True:
         move_to_pending_decode(prefill_batch, ready_to_decode)
     else:
         # decode
-        admit_ready_requests(pending_decode, active_decode)
+        active_decode = select_decode_batch(pending_decode)
         next_tokens = model.decode(active_decode)
         update_sequences(next_tokens)
-        remove_finished_requests(active_decode, finished)
+        move_finished_requests(active_decode, finished)
+        return_unfinished_to_pending_decode(active_decode, pending_decode)
 ```
+
+Here, `active_decode` only exists for a single decode execution. After that step, unfinished requests go back to `pending_decode` and finished requests move to `finished`.
 
 At each scheduling step, the server decides whether to run a prefill step, a decode step, or a mix. Mixing prefill and decode requires more sophisticated scheduling and kernels, and ragged representations can help execute such variable-shaped work efficiently (see "Ragged Batching" section below).
 
 Prefill has better arithmetic intensity because it processes sequence positions in parallel, resulting in higher GPU utilization. It directly affects time-to-first-token (TTFT).  Decode has lower arithmetic and is often more memory intensive due to KV-cache access. It directly affects inter-token latency. 
 
 Whether to prioritize prefill or decode is a tradeoff: TTFT vs. inter-token latency, GPU utilization, etc. 
+
+### Model API Boundary
+
+One of the most important implementation decisions is how to split responsibilities between the shared model execution path and the batching-mode-specific wrappers.
+
+Our design:
+
+* `model.forward()` is batching-agnostic. It operates on normalized dense execution inputs, takes in raw prior KV state for the current execution, and returns the newly produced KV state for the current input. It does **not** own persistent KV-cache mutation and only computes logits and new KV slices.
+* `model.generate()` is a wrapper around `model.forward()` for offline inference and static batching.
+* `model.prefill()` and `model.decode()` are wrappers around `model.forward()` for continuous batching.
+
+It is important that `model.forward()` does not own KV-cache mutation because static batching and continuous batching need different persistent cache interfaces:
+
+* In static batching, the natural cache interface is batch-oriented: one rectangular KV cache for the whole batch.
+* In continuous batching, the natural cache interface is sequence-oriented: each request needs its own resumable KV state.
+
+If `model.forward()` mutated a particular cache object directly, it would become tied to one specific persistent KV representation. By keeping `forward()` limited to raw dense KV inputs/outputs, the wrappers are free to implement the cache orchestration differently for static batching and continuous batching.
+
+This means the wrappers are responsible for orchestration:
+
+* gathering persistent state into the dense execution view needed by `model.forward()`
+* constructing batching-mode-specific `attn_mask` and `position_ids`
+* appending the returned KV slices back into the persistent cache representation
+
+Under this split, `model.forward()` stays reusable across static batching and continuous batching, while `generate`, `prefill`, and `decode` each handle the bookkeeping specific to their execution mode.
 
 ### KV Cache
 
@@ -265,11 +293,13 @@ Ragged batching avoids representing the batch as a fully rectangular tensor of s
 
 Continuous batching should be understood as a scheduling technique. It updates the active decode set after each decode iteration: finished requests are removed immediately, and decode-ready requests are admitted into freed capacity.
 
-At the server-flow level, requests move through a lifecycle:
+At the server-flow level, requests move through the durable lifecycle:
 
 ```
-pending_prefill -> pending_decode -> active_decode -> finished
+pending_prefill -> pending_decode -> finished
 ```
+
+During a decode step, the scheduler temporarily selects an `active_decode` subset from `pending_decode` for that one execution.
 
 The scheduler balances prefill and decode work. Prefill affects time-to-first-token and tends to have higher arithmetic intensity. Decode affects inter-token latency and is often constrained by KV-cache memory bandwidth.
 
