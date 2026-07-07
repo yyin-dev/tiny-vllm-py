@@ -33,6 +33,13 @@ def run_singleton_prefill(
     return prefill_token, cache
 
 
+def run_singleton_decode(
+    model, prev_token: torch.Tensor, cache: RequestKVCache
+) -> tuple[torch.Tensor, RequestKVCache]:
+    [decode_token] = model.decode([(prev_token, cache)])
+    return decode_token, cache
+
+
 # Verify that running in batch matches running as singletons
 def test_continuous_batching_prefill_matches_singletons(local_model_cpu, tokenizer):
     model = local_model_cpu
@@ -63,3 +70,84 @@ def test_continuous_batching_prefill_matches_singletons(local_model_cpu, tokeniz
             singleton_cache,
             num_layers=len(model.layers),
         )
+
+
+def test_continuous_batching_decode_matches_singletons(local_model_cpu, tokenizer):
+    model = local_model_cpu
+    device = "cpu"
+
+    prompts = [
+        "Hi!",
+        "A really really really really long prompt",
+    ]
+    encoded = tokenizer(prompts)
+    prompt_tensors = [torch.tensor([ids], device=device) for ids in encoded.input_ids]
+
+    batched_caches = [RequestKVCache() for _ in prompt_tensors]
+    batched_prefill_tokens = model.prefill(
+        list(zip(prompt_tensors, batched_caches, strict=True))
+    )
+    batched_decode_tokens = model.decode(
+        list(zip(batched_prefill_tokens, batched_caches, strict=True))
+    )
+
+    assert len(batched_decode_tokens) == len(prompt_tensors)
+
+    for prompt, batched_decode_token, batched_cache in zip(
+        prompt_tensors, batched_decode_tokens, batched_caches, strict=True
+    ):
+        singleton_prefill_token, singleton_cache = run_singleton_prefill(model, prompt)
+        singleton_decode_token, singleton_cache = run_singleton_decode(
+            model, singleton_prefill_token, singleton_cache
+        )
+
+        assert torch.equal(batched_decode_token, singleton_decode_token)
+        assert_request_kv_cache_equal(
+            batched_cache,
+            singleton_cache,
+            num_layers=len(model.layers),
+        )
+
+
+def test_continuous_batching_decode_matches_multiple_singleton_steps(
+    local_model_cpu, tokenizer
+):
+    model = local_model_cpu
+    device = "cpu"
+
+    prompts = [
+        "Hello!",
+        "Hi! How are you?",
+    ]
+    encoded = tokenizer(prompts)
+    prompt_tensors = [torch.tensor([ids], device=device) for ids in encoded.input_ids]
+
+    batched_caches = [RequestKVCache() for _ in prompt_tensors]
+    batched_tokens = model.prefill(list(zip(prompt_tensors, batched_caches, strict=True)))
+
+    singleton_states = []
+    for prompt in prompt_tensors:
+        singleton_token, singleton_cache = run_singleton_prefill(model, prompt)
+        singleton_states.append((singleton_token, singleton_cache))
+
+    decode_steps = 3
+    for _ in range(decode_steps):
+        batched_tokens = model.decode(list(zip(batched_tokens, batched_caches, strict=True)))
+
+        next_singleton_states = []
+        for batched_token, batched_cache, (singleton_token, singleton_cache) in zip(
+            batched_tokens, batched_caches, singleton_states, strict=True
+        ):
+            singleton_next_token, singleton_cache = run_singleton_decode(
+                model, singleton_token, singleton_cache
+            )
+
+            assert torch.equal(batched_token, singleton_next_token)
+            assert_request_kv_cache_equal(
+                batched_cache,
+                singleton_cache,
+                num_layers=len(model.layers),
+            )
+            next_singleton_states.append((singleton_next_token, singleton_cache))
+
+        singleton_states = next_singleton_states
