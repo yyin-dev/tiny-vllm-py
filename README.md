@@ -1,10 +1,22 @@
 # tiny-vllm-py
 
 This project is a learning-oriented LLM inference engine built from scratch. It prioritizes clarity and hands-on understanding over
-raw performance: the implementation is in Python, avoids custom CUDA kernels, and uses manually implemented model components on top
-of PyTorch tensor ops. The initial scope is intentionally narrow, focusing on a single fixed model family and the minimum set of
-modules needed to run it. The main objective is to understand and implement serving-side inference techniques such as prefill/
-decode separation, KV cache management, and continuous batching.
+raw performance: the implementation is in Python, avoids custom CUDA kernels, and uses manually implemented model components on top of PyTorch tensor ops. The initial scope is intentionally narrow, focusing on a single fixed model family and the minimum set of modules needed to run it. The main objective is to understand and implement serving-side inference techniques such as prefill/decode separation, KV cache management, and continuous batching.
+
+## Architecture
+
+At a high level, the project is split into three layers:
+
+* **Model execution**: `model.forward()` and the internal modules in `model.py` run the actual transformer computation on normalized dense inputs.
+* **Inference-mode wrappers**: `model.generate()` handles offline generation / static batching, while `model.prefill()` and `model.decode()` expose the shared model path in a form suitable for continuous batching.
+* **Serving / scheduling**: `Engine` owns request lifecycle, batching policy, and per-request KV-cache ownership for continuous batching.
+
+A useful mental model is:
+
+* **Top level**: request lifecycle and server loop
+* **Middle level**: scheduling strategy, such as static batching vs. continuous batching
+* **Bottom level**: execution and memory mechanisms, such as KV cache layout, attention masks, position ids, and later paged KV cache / paged attention
+
 
 ## Milestones
 
@@ -13,6 +25,45 @@ decode separation, KV cache management, and continuous batching.
 - [x] Static batching
 - [x] Continuous batching
 - [ ] Paged KV cache
+
+## Key Takeaways
+
+* **Prefill and decode are different workloads**: prefill computes prompt K/V and mainly affects TTFT; decode reuses KV cache and mainly affects inter-token latency.
+* **KV cache changes the attention dataflow**: decode should compute K/V only for the new token and attend over full K/V constructed from cached prefix.
+* **Static batching is about correctness under padding**: the key distinction is physical batch layout vs. logical sequence, which makes attention masks and position ids crucial.
+* **Continuous batching is a scheduling problem**: requests move through `pending_prefill -> pending_decode -> finished`, while `active_decode` is only a transient execution set.
+* **Scheduling and memory layout are separate concerns**: continuous batching improves utilization, while later ideas like paged KV / paged attention address KV memory management and execution layout.
+
+## Benchmark Data
+
+The repo also includes benchmark data for three different layers of the system:
+
+* **Inference modes**: model-side comparisons such as singleton vs. batched generation, with and without KV cache.
+* **Scheduler simulation**: a policy-only benchmark that isolates static vs. continuous batching without running the real model.
+* **Serving policies**: an end-to-end wall-clock benchmark comparing static vs. continuous batching on the local model.
+
+High-signal highlights from the latest saved runs:
+
+Inference modes (`batch_size=4`, `max_new_tokens=4`)
+
+| Scenario | Wall time (s) | New tok/s | Speedup |
+| --- | ---: | ---: | ---: |
+| `singleton_no_kv` | 2.762 | 5.79 | `1.00x` |
+| `singleton_kv` | 1.876 | 8.53 | `1.47x` |
+| `static_batch_no_kv` | 1.130 | 14.16 | `2.45x` |
+| `static_batch_kv` | 0.581 | 27.54 | `4.75x` |
+| `continuous_batch_kv` | 0.671 | 23.84 | `4.11x` |
+
+Serving policies (`capacity=4`, 8 requests, varying workload skew)
+
+| Workload | Static wall (s) | Continuous wall (s) | Speedup |
+| --- | ---: | ---: | ---: |
+| `uniform` | 2.003 | 2.189 | `0.91x` |
+| `moderately_uneven` | 2.879 | 2.645 | `1.09x` |
+| `highly_uneven` | 3.641 | 2.495 | `1.46x` |
+| `extreme_uneven` | 7.565 | 4.382 | `1.73x` |
+
+See `benchmark/README.md` for methodology and results.
 
 ## Checkpoint loading & Forward generation
 

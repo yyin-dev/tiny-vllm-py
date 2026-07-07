@@ -1,0 +1,166 @@
+{
+  "timestamp": "2026-07-06 23:06:08",
+  "platform": "macOS-15.5-arm64-arm-64bit",
+  "python": "3.12.11",
+  "torch": "2.12.1",
+  "device": "mps",
+  "mps_available": true,
+  "prompts": [
+    "Summarize how KV cache helps autoregressive decoding in one sentence.",
+    "Write two short bullet points about the difference between prefill and decode.",
+    "Explain why static batching needs attention masks and position ids when prompts have different lengths.",
+    "Give a short explanation of why continuous batching is a scheduling technique."
+  ],
+  "max_new_tokens": 4,
+  "repeats": 2,
+  "warmup": 1,
+  "scenarios": [
+    {
+      "name": "singleton_no_kv",
+      "scenario_group": "full_generation",
+      "wall_time_s": 2.761974083026871,
+      "new_tokens": 16,
+      "prompt_tokens": 63,
+      "requests": 4,
+      "timed_input_tokens": null,
+      "steps": null,
+      "note": null,
+      "new_tokens_per_s": 5.792958050665509,
+      "total_tokens_per_s": 28.602730375160952,
+      "timed_input_tokens_per_s": null,
+      "all_wall_times_s": [
+        2.761974083026871,
+        2.816588999936357
+      ],
+      "median_wall_time_s": 2.789281541481614,
+      "min_wall_time_s": 2.761974083026871
+    },
+    {
+      "name": "singleton_kv",
+      "scenario_group": "full_generation",
+      "wall_time_s": 1.876272667082958,
+      "new_tokens": 16,
+      "prompt_tokens": 63,
+      "requests": 4,
+      "timed_input_tokens": null,
+      "steps": null,
+      "note": null,
+      "new_tokens_per_s": 8.527545212751624,
+      "total_tokens_per_s": 42.104754487961145,
+      "timed_input_tokens_per_s": null,
+      "all_wall_times_s": [
+        1.876272667082958,
+        1.8785284170880914
+      ],
+      "median_wall_time_s": 1.8774005420855246,
+      "min_wall_time_s": 1.876272667082958
+    },
+    {
+      "name": "static_batch_no_kv",
+      "scenario_group": "full_generation",
+      "wall_time_s": 1.1295842919498682,
+      "new_tokens": 16,
+      "prompt_tokens": 63,
+      "requests": 4,
+      "timed_input_tokens": null,
+      "steps": null,
+      "note": null,
+      "new_tokens_per_s": 14.164502918486132,
+      "total_tokens_per_s": 69.93723316002529,
+      "timed_input_tokens_per_s": null,
+      "all_wall_times_s": [
+        1.1442997079575434,
+        1.1295842919498682
+      ],
+      "median_wall_time_s": 1.1369419999537058,
+      "min_wall_time_s": 1.1295842919498682
+    },
+    {
+      "name": "static_batch_kv",
+      "scenario_group": "full_generation",
+      "wall_time_s": 0.5809640000807121,
+      "new_tokens": 16,
+      "prompt_tokens": 63,
+      "requests": 4,
+      "timed_input_tokens": null,
+      "steps": null,
+      "note": null,
+      "new_tokens_per_s": 27.540432794075283,
+      "total_tokens_per_s": 135.9808869207467,
+      "timed_input_tokens_per_s": null,
+      "all_wall_times_s": [
+        0.5809640000807121,
+        0.6407596250064671
+      ],
+      "median_wall_time_s": 0.6108618125435896,
+      "min_wall_time_s": 0.5809640000807121
+    },
+    {
+      "name": "prefill_only",
+      "scenario_group": "microbenchmark",
+      "wall_time_s": 0.3455485829617828,
+      "new_tokens": 4,
+      "prompt_tokens": 63,
+      "requests": 4,
+      "timed_input_tokens": 63,
+      "steps": null,
+      "note": "Measures one batched prefill call that emits the first token for each request.",
+      "new_tokens_per_s": 11.575796276503308,
+      "total_tokens_per_s": 193.89458763143043,
+      "timed_input_tokens_per_s": 182.3187913549271,
+      "all_wall_times_s": [
+        0.3788928330177441,
+        0.3455485829617828
+      ],
+      "median_wall_time_s": 0.36222070798976347,
+      "min_wall_time_s": 0.3455485829617828
+    },
+    {
+      "name": "decode_only",
+      "scenario_group": "microbenchmark",
+      "wall_time_s": 0.10801458288915455,
+      "new_tokens": 4,
+      "prompt_tokens": 63,
+      "requests": 4,
+      "timed_input_tokens": 4,
+      "steps": null,
+      "note": "Measures one batched decode iteration after caches have already been populated by prefill.",
+      "new_tokens_per_s": 37.032036721419665,
+      "total_tokens_per_s": 620.2866150837795,
+      "timed_input_tokens_per_s": 37.032036721419665,
+      "all_wall_times_s": [
+        0.1122182080289349,
+        0.10801458288915455
+      ],
+      "median_wall_time_s": 0.11011639545904472,
+      "min_wall_time_s": 0.10801458288915455
+    },
+    {
+      "name": "continuous_batch_kv",
+      "scenario_group": "full_generation",
+      "wall_time_s": 0.6712703749071807,
+      "new_tokens": 16,
+      "prompt_tokens": 63,
+      "requests": 4,
+      "timed_input_tokens": null,
+      "steps": 4,
+      "note": "Uses the current Engine implementation with all requests arriving at time 0.",
+      "new_tokens_per_s": 23.83540313724166,
+      "total_tokens_per_s": 117.6873029901307,
+      "timed_input_tokens_per_s": null,
+      "all_wall_times_s": [
+        0.6830077919876203,
+        0.6712703749071807
+      ],
+      "median_wall_time_s": 0.6771390834474005,
+      "min_wall_time_s": 0.6712703749071807
+    }
+  ],
+  "notes": [
+    "These measurements are relative comparisons on the local machine, not production GPU benchmarks.",
+    "The local implementation is Python/PyTorch and does not use custom CUDA kernels.",
+    "continuous_batch_kv measures the current Engine path with all requests submitted up front.",
+    "Only the full_generation scenarios should be interpreted as direct speedup peers.",
+    "prefill_only and decode_only are stage-level microbenchmarks and do not perform the same total work as full generation."
+  ]
+}
