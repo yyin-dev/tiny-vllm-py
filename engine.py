@@ -30,6 +30,11 @@ class DecodeReadyRequest:
         self.generated_tokens = torch.cat([self.generated_tokens, token], dim=-1)
 
 
+class FinishedRequest:
+    def __init__(self, decode_ready_request: DecodeReadyRequest):
+        self.id = decode_ready_request.id
+
+
 class Op(Enum):
     Prefill = 1
     Decode = 2
@@ -51,11 +56,19 @@ class Engine:
         self.tokenizer = tokenizer
         self.pending_prefill: List[Request] = []
         self.pending_decode: List[DecodeReadyRequest] = []
-        self.finished: List[DecodeReadyRequest] = []
+        self.finished: List[FinishedRequest] = []
 
         self.prefill_batch_size = 2
         self.decode_batch_size = 4
         self.prefill_threshold = prefill_threshold
+
+    def add_request(self, request: Request):
+        self.pending_prefill.append(request)
+
+    def collect_finished_requests(self):
+        finished_ids = [req.id for req in self.finished]
+        self.finished.clear()
+        return finished_ids
 
     def next_step_op(self) -> Op:
         if len(self.pending_prefill) >= self.prefill_threshold:
@@ -118,7 +131,7 @@ class Engine:
 
                     prefill_token_int = int(prefill_token.item())
                     if prefill_token_int == self.tokenizer.eos_token_id:
-                        self.finished.append(decode_ready_request)
+                        self.finished.append(FinishedRequest(decode_ready_request))
                     else:
                         self.pending_decode.append(decode_ready_request)
 
@@ -141,7 +154,7 @@ class Engine:
                     decode_token_int = int(decode_token.item())
 
                     if decode_token_int == self.tokenizer.eos_token_id:
-                        self.finished.append(request)
+                        self.finished.append(FinishedRequest(request))
                     else:
                         unfinished_requests.append(request)
 

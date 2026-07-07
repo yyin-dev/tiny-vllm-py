@@ -11,7 +11,7 @@ decode separation, KV cache management, and continuous batching.
 - [x] Checkpoint loading & Forward decode
 - [x] KV cache
 - [x] Static batching
-- [ ] Continuous batching
+- [x] Continuous batching
 - [ ] Paged KV cache
 
 ## Checkpoint loading & Forward generation
