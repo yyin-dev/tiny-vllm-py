@@ -36,6 +36,7 @@ def device() -> str:
 def local_model(device: str) -> LlamaLM:
     model: LlamaLM = load_model()
     model = model.to(device).eval()
+    model.requires_grad_(False)
     return model
 
 
@@ -43,6 +44,7 @@ def local_model(device: str) -> LlamaLM:
 def local_model_cpu() -> LlamaLM:
     model: LlamaLM = load_model()
     model = model.to("cpu").eval()
+    model.requires_grad_(False)
     return model
 
 
@@ -62,6 +64,7 @@ def reference_model(device: str) -> LlamaForCausalLM:
     if device == "mps":
         model = model.float()
 
+    model.requires_grad_(False)
     return model
 
 
