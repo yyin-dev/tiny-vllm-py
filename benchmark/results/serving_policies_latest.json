@@ -1,0 +1,304 @@
+{
+  "timestamp": "2026-07-06 23:33:34",
+  "device": "mps",
+  "capacity": 4,
+  "prompts": [
+    "Explain how KV cache changes the cost of autoregressive decoding in two sentences.",
+    "Define KV cache.",
+    "What is prefill?",
+    "What is decode?",
+    "Describe the difference between static batching and continuous batching for an inference server.",
+    "What is TTFT?",
+    "What is inter-token latency?",
+    "Why do attention masks matter with padding?"
+  ],
+  "repeats": 2,
+  "warmup": 1,
+  "workloads": [
+    {
+      "name": "uniform",
+      "target_new_tokens": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "note": "All requests have the same target length, so static and continuous batching should behave similarly.",
+      "results": [
+        {
+          "name": "static_policy",
+          "wall_time_s": 2.002635041018948,
+          "requests": 8,
+          "capacity": 4,
+          "prompt_tokens": 71,
+          "total_target_new_tokens": 64,
+          "mean_completion_time_s": 1.504536000022199,
+          "max_completion_time_s": 2.002620375016704,
+          "completion_times_s": [
+            1.0064516250276938,
+            1.0064516250276938,
+            1.0064516250276938,
+            1.0064516250276938,
+            2.002620375016704,
+            2.002620375016704,
+            2.002620375016704,
+            2.002620375016704
+          ],
+          "note": "Processes fixed cohorts of size capacity and keeps decoding each cohort until its longest request completes.",
+          "all_wall_times_s": [
+            2.0824955839198083,
+            2.002635041018948
+          ],
+          "median_wall_time_s": 2.042565312469378,
+          "min_wall_time_s": 2.002635041018948
+        },
+        {
+          "name": "continuous_policy",
+          "wall_time_s": 2.188997291959822,
+          "requests": 8,
+          "capacity": 4,
+          "prompt_tokens": 71,
+          "total_target_new_tokens": 64,
+          "mean_completion_time_s": 1.7758050835109316,
+          "max_completion_time_s": 2.1888121670344844,
+          "completion_times_s": [
+            1.3627979999873787,
+            1.3627979999873787,
+            1.3627979999873787,
+            1.3627979999873787,
+            2.1888121670344844,
+            2.1888121670344844,
+            2.1888121670344844,
+            2.1888121670344844
+          ],
+          "note": "Uses the real Engine scheduling loop and treats each request as benchmark-complete once it reaches its target token count.",
+          "all_wall_times_s": [
+            2.188997291959822,
+            2.2071474159602076
+          ],
+          "median_wall_time_s": 2.198072353960015,
+          "min_wall_time_s": 2.188997291959822
+        }
+      ]
+    },
+    {
+      "name": "moderately_uneven",
+      "target_new_tokens": [
+        12,
+        8,
+        8,
+        8,
+        12,
+        8,
+        8,
+        8
+      ],
+      "note": "A mildly skewed trace where some requests run longer but the gap is limited.",
+      "results": [
+        {
+          "name": "static_policy",
+          "wall_time_s": 2.879164666053839,
+          "requests": 8,
+          "capacity": 4,
+          "prompt_tokens": 71,
+          "total_target_new_tokens": 72,
+          "mean_completion_time_s": 1.821086161173298,
+          "max_completion_time_s": 2.879151041037403,
+          "completion_times_s": [
+            0.9973252080380917,
+            0.9973252080380917,
+            0.9973252080380917,
+            1.4337550000054762,
+            2.42126920807641,
+            2.42126920807641,
+            2.42126920807641,
+            2.879151041037403
+          ],
+          "note": "Processes fixed cohorts of size capacity and keeps decoding each cohort until its longest request completes.",
+          "all_wall_times_s": [
+            2.879164666053839,
+            2.8796867500059307
+          ],
+          "median_wall_time_s": 2.879425708029885,
+          "min_wall_time_s": 2.879164666053839
+        },
+        {
+          "name": "continuous_policy",
+          "wall_time_s": 2.644694625050761,
+          "requests": 8,
+          "capacity": 4,
+          "prompt_tokens": 71,
+          "total_target_new_tokens": 72,
+          "mean_completion_time_s": 1.9620595308078919,
+          "max_completion_time_s": 2.644529166049324,
+          "completion_times_s": [
+            1.3835579580627382,
+            1.3835579580627382,
+            1.3835579580627382,
+            1.8524637080263346,
+            2.202140166074969,
+            2.202140166074969,
+            2.644529166049324,
+            2.644529166049324
+          ],
+          "note": "Uses the real Engine scheduling loop and treats each request as benchmark-complete once it reaches its target token count.",
+          "all_wall_times_s": [
+            2.644694625050761,
+            2.6503182080341503
+          ],
+          "median_wall_time_s": 2.6475064165424556,
+          "min_wall_time_s": 2.644694625050761
+        }
+      ]
+    },
+    {
+      "name": "highly_uneven",
+      "target_new_tokens": [
+        16,
+        4,
+        4,
+        4,
+        16,
+        4,
+        4,
+        4
+      ],
+      "note": "A skewed trace where short requests leave dead slots behind under static batching.",
+      "results": [
+        {
+          "name": "static_policy",
+          "wall_time_s": 3.6408797909971327,
+          "requests": 8,
+          "capacity": 4,
+          "prompt_tokens": 71,
+          "total_target_new_tokens": 56,
+          "mean_completion_time_s": 1.7797441608272493,
+          "max_completion_time_s": 3.640867874957621,
+          "completion_times_s": [
+            0.5477004159474745,
+            0.5477004159474745,
+            0.5477004159474745,
+            1.8306066659279168,
+            2.3744591659633443,
+            2.3744591659633443,
+            2.3744591659633443,
+            3.640867874957621
+          ],
+          "note": "Processes fixed cohorts of size capacity and keeps decoding each cohort until its longest request completes.",
+          "all_wall_times_s": [
+            3.6408797909971327,
+            3.730428999988362
+          ],
+          "median_wall_time_s": 3.6856543954927474,
+          "min_wall_time_s": 3.6408797909971327
+        },
+        {
+          "name": "continuous_policy",
+          "wall_time_s": 2.495007249992341,
+          "requests": 8,
+          "capacity": 4,
+          "prompt_tokens": 71,
+          "total_target_new_tokens": 56,
+          "mean_completion_time_s": 1.420179677210399,
+          "max_completion_time_s": 2.4948741249972954,
+          "completion_times_s": [
+            0.8948240419849753,
+            0.8948240419849753,
+            0.8948240419849753,
+            1.2243772499496117,
+            1.2243772499496117,
+            1.5539990419056267,
+            2.17933762492612,
+            2.4948741249972954
+          ],
+          "note": "Uses the real Engine scheduling loop and treats each request as benchmark-complete once it reaches its target token count.",
+          "all_wall_times_s": [
+            2.5891402090201154,
+            2.495007249992341
+          ],
+          "median_wall_time_s": 2.542073729506228,
+          "min_wall_time_s": 2.495007249992341
+        }
+      ]
+    },
+    {
+      "name": "extreme_uneven",
+      "target_new_tokens": [
+        32,
+        4,
+        4,
+        4,
+        32,
+        4,
+        4,
+        4
+      ],
+      "note": "A stress-test trace where one long request shares each cohort with three very short requests.",
+      "results": [
+        {
+          "name": "static_policy",
+          "wall_time_s": 7.564784207963385,
+          "requests": 8,
+          "capacity": 4,
+          "prompt_tokens": 71,
+          "total_target_new_tokens": 88,
+          "mean_completion_time_s": 3.265124400917557,
+          "max_completion_time_s": 7.5647715830709785,
+          "completion_times_s": [
+            0.5773558330256492,
+            0.5773558330256492,
+            0.5773558330256492,
+            3.7722087500151247,
+            4.350649125059135,
+            4.350649125059135,
+            4.350649125059135,
+            7.5647715830709785
+          ],
+          "note": "Processes fixed cohorts of size capacity and keeps decoding each cohort until its longest request completes.",
+          "all_wall_times_s": [
+            7.564784207963385,
+            7.628099832916632
+          ],
+          "median_wall_time_s": 7.5964420204400085,
+          "min_wall_time_s": 7.564784207963385
+        },
+        {
+          "name": "continuous_policy",
+          "wall_time_s": 4.3820459169801325,
+          "requests": 8,
+          "capacity": 4,
+          "prompt_tokens": 71,
+          "total_target_new_tokens": 88,
+          "mean_completion_time_s": 1.9102106458303751,
+          "max_completion_time_s": 4.381934707984328,
+          "completion_times_s": [
+            0.9097342919558287,
+            0.9097342919558287,
+            0.9097342919558287,
+            1.260361332911998,
+            1.260361332911998,
+            1.6068686669459566,
+            4.042956250021234,
+            4.381934707984328
+          ],
+          "note": "Uses the real Engine scheduling loop and treats each request as benchmark-complete once it reaches its target token count.",
+          "all_wall_times_s": [
+            4.415987499989569,
+            4.3820459169801325
+          ],
+          "median_wall_time_s": 4.399016708484851,
+          "min_wall_time_s": 4.3820459169801325
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "This benchmark measures real wall-clock time on the local model for two serving policies.",
+    "Within each workload, both policies use the same prompts and the same per-request target output lengths.",
+    "The purpose is to show that refillable decode membership helps more as request lengths become more uneven."
+  ]
+}
