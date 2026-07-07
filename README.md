@@ -1,32 +1,57 @@
 # tiny-vllm-py
 
-This project is a learning-oriented LLM inference engine built from scratch. It prioritizes clarity and hands-on understanding over
-raw performance: the implementation is in Python, avoids custom CUDA kernels, and uses manually implemented model components on top of PyTorch tensor ops. The initial scope is intentionally narrow, focusing on a single fixed model family and the minimum set of modules needed to run it. The main objective is to understand and implement serving-side inference techniques such as prefill/decode separation, KV cache management, and continuous batching.
+`tiny-vllm-py` is a learning-oriented LLM inference engine built from scratch in Python/PyTorch. The goal is not to reproduce production systems like vLLM feature-for-feature, but to understand the core ideas by implementing them directly: checkpoint loading, transformer forward execution, KV cache, static batching, and continuous batching.
 
-## Architecture
+The project intentionally prioritizes clarity over raw speed:
 
-At a high level, the project is split into three layers:
+* no custom CUDA kernels
+* no distributed serving stack
+* a narrow model scope
+* explicit model and scheduler code instead of hiding everything behind frameworks
 
-* **Model execution**: `model.forward()` and the internal modules in `model.py` run the actual transformer computation on normalized dense inputs.
-* **Inference-mode wrappers**: `model.generate()` handles offline generation / static batching, while `model.prefill()` and `model.decode()` expose the shared model path in a form suitable for continuous batching.
-* **Serving / scheduling**: `Engine` owns request lifecycle, batching policy, and per-request KV-cache ownership for continuous batching.
+That makes it a good project for studying how serving-side LLM inference actually works.
 
-A useful mental model is:
+## Overview
 
-* **Top level**: request lifecycle and server loop
-* **Middle level**: scheduling strategy, such as static batching vs. continuous batching
-* **Bottom level**: execution and memory mechanisms, such as KV cache layout, attention masks, position ids, and later paged KV cache / paged attention
+This repo focuses on four main inference ideas:
 
+* **Checkpoint-compatible local execution**: load a real Llama checkpoint into a local PyTorch model and validate it against a reference implementation.
+* **KV cache**: separate prefill and decode, and reuse cached K/V state correctly during decode.
+* **Static batching**: handle padding, attention masks, and logical position ids for static batching.
+* **Continuous batching & serving-side scheduling**: build a small continuous-batching engine with per-request KV ownership and benchmark scheduling tradeoffs.
 
-## Milestones
+## Current Status
 
-- [x] Checkpoint loading & Forward decode
+- [x] Checkpoint loading & forward / generation correctness
 - [x] KV cache
 - [x] Static batching
 - [x] Continuous batching
 - [ ] Paged KV cache
 
-## Key Takeaways
+## Scope
+
+- Model family: `meta-llama/Llama-3.2-1B-Instruct`
+- Implementation language: Python + PyTorch
+- Focus: correctness, batching semantics, and scheduling behavior
+- Non-goals: production throughput, custom kernels, distributed inference
+
+## Architecture
+
+The implementation is split into three layers:
+
+* **Model execution**: `model.forward()` and the modules in `model.py` run transformer computation on normalized dense inputs.
+* **Inference-mode wrappers**: `model.generate()` handles offline generation / static batching, while `model.prefill()` and `model.decode()` expose a shared model path for continuous batching.
+* **Serving / scheduling**: `Engine` manages request lifecycle, batching policy, and per-request KV-cache ownership.
+
+Useful mental model:
+
+* **Top level**: request lifecycle and inference loop
+* **Middle level**: scheduling strategy, such as static batching vs. continuous batching
+* **Bottom level**: execution and memory mechanisms, such as KV cache layout, attention masks, position ids, and later paged KV cache / paged attention
+
+## Key Ideas
+
+Before diving into the milestone writeups below, these are the main ideas that shaped the implementation:
 
 * **Prefill and decode are different workloads**: prefill computes prompt K/V and mainly affects TTFT; decode reuses KV cache and mainly affects inter-token latency.
 * **KV cache changes the attention dataflow**: decode should compute K/V only for the new token and attend over full K/V constructed from cached prefix.
@@ -34,7 +59,7 @@ A useful mental model is:
 * **Continuous batching is a scheduling problem**: requests move through `pending_prefill -> pending_decode -> finished`, while `active_decode` is only a transient execution set.
 * **Scheduling and memory layout are separate concerns**: continuous batching improves utilization, while later ideas like paged KV / paged attention address KV memory management and execution layout.
 
-## Benchmark Data
+## Benchmark Snapshot
 
 The repo also includes benchmark data for three different layers of the system:
 
