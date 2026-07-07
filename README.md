@@ -312,6 +312,78 @@ A layered view:
 - Bottom level: execution and memory mechanisms, such as KV cache management, ragged batching, and paged KV cache and paged attention (later milestones).
 
 
+## Paged KV Cache / Paged Attention
+
+### Problem
+
+Continuous batching fixes a scheduling problem, but it does not by itself fix how KV cache is stored in memory.
+
+If each request owns one contiguous, growable KV region, there are two main sources of waste:
+
+* **Internal fragmentation**: a request may reserve more KV capacity than it eventually uses, leaving unused space at the tail.
+* **External fragmentation**: even if the system still has free memory, it may be split into many holes so that allocating another large contiguous KV region is impossible.
+
+There is also a problem with appending: when appending KV during decode, a contiguous scheme either needs to over-reserve capacity up front or occasionally reallocate / copy into a larger region.
+
+So the core limitation of the current per-request dense KV cache is not correctness, but memory management.
+
+### Mental Model
+
+Paged KV cache borrows the basic idea of virtual memory:
+
+* Do not store each request's KV cache as one contiguous range.
+* Instead, store KV entries in fixed-size **blocks**.
+* Each request keeps a **block table** that maps its **logical block index** to a **physical block** in memory.
+
+This means the logical token prefix still behaves like one contiguous sequence:
+
+```
+token positions:  0 1 2 3 | 4 5 6 7 | 8 9
+logical blocks:     0         1        2
+physical blocks:   17         4       23
+```
+
+From the model's point of view, the sequence is still token positions `0..9` in order. What changes is only where the corresponding KV entries physically live.
+
+Under this design:
+
+* Appending a token usually means writing into the current tail block.
+* If the tail block is full, allocate one more block.
+* A request no longer needs one large contiguous KV allocation in order to grow.
+
+This largely eliminates the harmful form of external fragmentation for this workload, and bounds internal fragmentation by at most the unused space in the last block of each sequence.
+
+### Why Paged Attention Is Needed
+
+Paged KV cache is a **memory-layout / allocation** idea. However, once KV entries are no longer contiguous, the kernel needs to be able to execute attention over a logically contiguous prefix whose KV entries are physically non-contiguous.
+
+**Paged KV cache** is about how KV state is stored and managed; **Paged attention** is about how attention consumes that storage layout efficiently. 
+
+If we still materialize a temporary dense KV tensor before each attention call, we do not realize the full performance benefit. The real gain comes from allowing attention to consume the paged layout directly.
+
+### Prefix Sharing
+
+The block-table abstraction also easily supports prefix sharing. If two requests have the same prefix, their block tables can point to the same physical prefix blocks. Each request still has its own logical view, but the actual KV data only needs to be stored once.
+
+When the requests diverge later:
+
+* old full prefix blocks can remain shared
+* each request gets its own later tail blocks
+* if a shared partial tail block would need to be written, copy-on-write is needed before the append
+
+### Relationship to Current Design
+
+Currently, `RequestKVCache` is conceptually:
+
+* one request
+* one dense KV prefix per layer
+
+The main new abstraction in paged KV cache would be:
+
+* fixed-size KV blocks as the unit of allocation/free
+* a per-request logical-to-physical block mapping
+
+A useful learning milestone is to change the persistent cache representation to blocks and block tables, while still materializing a temporary dense KV prefix for forward pass. This preserves correctness while making the storage abstraction match what production systems do, without requiring a paged-attention implementation.
 
 ## Directory Structure
 - `tests/`: testcases. Runnable throughout the project.
